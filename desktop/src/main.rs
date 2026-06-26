@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use ruffle_core::backend::navigator::{OwnedFuture, SocketMode};
 use ruffle_core::events::{ImeEvent, MouseButton as RuffleButton, MouseWheelDelta};
@@ -41,6 +41,10 @@ mod keymap;
 /// iOS 纯触摸复制/粘贴工具条(原生 UIView 叠层)。
 #[cfg(target_os = "ios")]
 mod ios_textbar;
+/// iOS 绿色多行调试 HUD(原生 UILabel 叠层,不吃触摸)。
+#[cfg(target_os = "ios")]
+#[allow(dead_code)]
+mod ios_debug_hud;
 
 /// winit 自定义事件:把 Ruffle 的异步任务调度回事件循环线程执行。
 enum UserEvent {
@@ -80,6 +84,10 @@ struct App {
     modifiers: Modifiers,
     last_tick: Instant,
     frames: u64,
+    /// 上次主动重置纹理池的时刻,限频用(避免反复重建 surface 卡顿)。
+    last_pool_trim: Instant,
+    /// 上次内存观测/守卫评估的时刻。锁帧后 RedrawRequested 稀疏,故守卫改时间驱动(在 about_to_wait)。
+    last_mem_check: Instant,
     /// 上次同步给引擎的绘制尺寸(物理像素),用于检测 iOS 布局/旋转后的尺寸变化。
     viewport: (u32, u32),
     /// 软键盘请求标志(来自 MoleUiBackend)+ 当前是否已开启,用于按需 set_ime_allowed。
@@ -88,6 +96,13 @@ struct App {
     /// iOS 纯触摸复制/粘贴工具条(文本框聚焦时显示)。
     #[cfg(target_os = "ios")]
     textbar: Option<ios_textbar::TextBar>,
+    /// 渲染后端 + GPU 名(build_player 时从 wgpu adapter 抓,给 HUD 显示)。
+    render_api: String,
+    /// 上次 HUD 取样时的渲染帧数,用于算实时 FPS。
+    last_hud_frames: u64,
+    /// iOS 绿色调试 HUD(左上角实时 FPS/内存/网络/渲染API/内核/温度)。
+    #[cfg(target_os = "ios")]
+    hud: Option<ios_debug_hud::DebugHud>,
 }
 
 /// 进入 tokio 运行时上下文(reqwest / socket 异步依赖它)。
@@ -111,15 +126,28 @@ fn surface_dims(window: &Window) -> (u32, u32) {
     (s.width.max(1), s.height.max(1))
 }
 
-/// 渲染降采样系数。iOS 真机渲染全屏物理像素(如 2868×1320)。注意:进游戏世界的 SIGKILL(OOM)
-/// 主要是 **MSAA**(离屏滤镜/cacheAsBitmap 目标按采样数倍增显存)——已用 StageQuality::Low 关掉,
-/// 那才是救命的一刀;render_scale 只缩主屏 framebuffer(占用很小、不碰离屏目标),对 OOM 贡献有限。
-/// 之前 0.6 砍掉了清晰度却换不来多少内存,反而画面/字体「纸糊」。故调回 **1.0 全原生分辨率**(真高清),
-/// 内存靠关 MSAA 守住。若个别机型仍紧或要更高帧率,可微降到 0.85(2438×1122,仍远超 960×560 源美术)。
+/// 渲染降采样系数。**1.0 = 全原生分辨率(最高清)**,iOS 也用 1.0。
+///
+/// 内存真相(真机 JetsamEvent 实测):进游戏世界/切场景被 signal 9 杀,死因 `per-process-limit`、
+/// 死时足迹 **3386MB**——撞的是 iOS 默认单 app 内存墙(12GB 机型默认仅给 ~3.4GB,跟 8GB 机型差不多)。
+/// render_scale **确实**会放大 cacheAsBitmap/滤镜/blend 离屏目标(地图等),显存随面积平方增长,
+/// 所以 1.0 比 0.7 更吃内存——但根因是内存墙太低 + 纹理池只进不出累积,不是分辨率本身。
+///
+/// 解法不再靠砍分辨率(0.6/0.7 换来的内存有限,画面却「纸糊」),而是:
+/// ① `increased-memory-limit` entitlement 把墙抬到 ~9GB(见 ios/MoleRuffle.entitlements),1.0 峰值塞得下;
+/// ② 运行时观测内存 + 余量过低时主动重置纹理池回收显存(见 RedrawRequested 里的 mem 逻辑)。
+/// 故全平台统一 1.0 真高清。若极端机型仍紧,可临时降到 0.85(2438×1122,仍远超 960×560 源美术)。
+const RENDER_SCALE: f64 = 1.0;
+
+/// 自适应内存守卫阈值(iOS)。研究结论:~5GB 足迹里 ~3-4GB 是 Ruffle 不压缩的解码位图(动不了),
+/// ~1GB 是纹理池(只进不出累积,**唯一可回收的大头**)。故守卫=按"距 jetsam 墙余量"主动清纹理池:
+/// 余量本身已反映各设备墙高(iPhone 6143 / iPad 8191 / 老机型更低),同一套绝对阈值即自适应。
+///   - SOFT:余量跌到这就提前回收(随累积上涨触发;大内存设备余量常年高于它→极少触发→几乎不卡)。
+///   - URGENT:更紧急,缩短回收间隔抢救,逼近墙也能稳住、永不 OOM。
 #[cfg(target_os = "ios")]
-const RENDER_SCALE: f64 = 1.0;
-#[cfg(not(target_os = "ios"))]
-const RENDER_SCALE: f64 = 1.0;
+const MEM_SOFT_FLOOR_MB: u64 = 1500;
+#[cfg(target_os = "ios")]
+const MEM_URGENT_MB: u64 = 700;
 
 /// 喂给 wgpu surface / 引擎 viewport 的渲染尺寸(物理像素 × RENDER_SCALE)。
 /// 注意:**触摸坐标也必须 ×RENDER_SCALE** 才与缩小后的 viewport 一致(见 Touch 处理),
@@ -136,6 +164,26 @@ fn render_dims(window: &Window) -> (u32, u32) {
     )
 }
 
+/// 内嵌的 Ruffle 引擎 git rev(pin 在 Cargo.toml;ruffle_core 不导出库版本常量,故硬编码)。给 HUD 显示。
+const RUFFLE_REV: &str = "Ruffle @304a3c9";
+
+/// wgpu Backend → 友好字符串(给 HUD"渲染 API"行)。
+#[cfg(target_os = "ios")]
+fn backend_str(b: wgpu::Backend) -> &'static str {
+    match b {
+        wgpu::Backend::Metal => "Metal",
+        wgpu::Backend::Vulkan => "Vulkan",
+        wgpu::Backend::Dx12 => "Direct3D 12",
+        wgpu::Backend::Gl => "OpenGL/GLES",
+        wgpu::Backend::BrowserWebGpu => "WebGPU",
+        wgpu::Backend::Noop => "Noop",
+    }
+}
+#[cfg(not(target_os = "ios"))]
+fn backend_str(b: wgpu::Backend) -> String {
+    format!("{b:?}")
+}
+
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>) -> anyhow::Result<Self> {
         Ok(Self {
@@ -149,28 +197,94 @@ impl App {
             modifiers: Modifiers::default(),
             last_tick: Instant::now(),
             frames: 0,
+            last_pool_trim: Instant::now(),
+            last_mem_check: Instant::now(),
             viewport: (0, 0),
             kbd: None,
             kbd_on: false,
             #[cfg(target_os = "ios")]
             textbar: None,
+            render_api: String::from("?"),
+            last_hud_frames: 0,
+            #[cfg(target_os = "ios")]
+            hud: None,
         })
     }
 
-    fn build_player(&self, window: Arc<Window>) -> (Arc<Mutex<Player>>, Arc<AtomicBool>) {
+    fn build_player(&self, window: Arc<Window>) -> (Arc<Mutex<Player>>, Arc<AtomicBool>, String) {
         // 渲染尺寸用 render_dims(iOS 已 ×RENDER_SCALE 降采样,省显存避免 jetsam)
         let (width, height) = render_dims(&window);
 
-        let renderer = unsafe {
-            WgpuRenderBackend::for_window_unsafe(
-                wgpu::SurfaceTargetUnsafe::from_window(window.as_ref())
-                    .expect("创建 wgpu surface target 失败"),
-                (width, height),
-                wgpu::Backends::PRIMARY,
-                wgpu::PowerPreference::HighPerformance,
-            )
-        }
-        .expect("创建 wgpu 渲染后端失败");
+        // 自建 wgpu device(复刻 ruffle for_window_unsafe + request_device,只改两处省内存):
+        //   ① memory_hints: MemoryUsage —— 让 Metal 分配器更紧凑,省 ~150-400MB 冗余(默认 Performance 偏大块预分配);
+        //   ② max_texture_dimension_2d 封顶 4096 —— 摩尔庄园源美术仅 960×560,足够;挡病态超大纹理分配。
+        // ruffle 把 wgpu 及 create_wgpu_instance / Descriptors::new / SwapChainTarget::new 都 pub 出来了,无需 fork。
+        let (renderer, render_api) = {
+            use ruffle_render_wgpu::backend::create_wgpu_instance;
+            use ruffle_render_wgpu::descriptors::Descriptors;
+            use ruffle_render_wgpu::target::SwapChainTarget;
+
+            let instance = create_wgpu_instance(wgpu::Backends::PRIMARY, wgpu::BackendOptions::default());
+            let surface = unsafe {
+                instance
+                    .create_surface_unsafe(
+                        wgpu::SurfaceTargetUnsafe::from_window(window.as_ref())
+                            .expect("创建 wgpu surface target 失败"),
+                    )
+                    .expect("创建 wgpu surface 失败")
+            };
+            let adapter = futures::executor::block_on(instance.request_adapter(
+                &wgpu::RequestAdapterOptions {
+                    power_preference: wgpu::PowerPreference::HighPerformance,
+                    compatible_surface: Some(&surface),
+                    force_fallback_adapter: false,
+                },
+            ))
+            .expect("无可用 GPU 适配器");
+
+            // 抓渲染后端 + GPU 名给 HUD(必须在 adapter 被 move 进 Descriptors::new 之前)。
+            let info = adapter.get_info();
+            let render_api = format!("{} · {}", backend_str(info.backend), info.name);
+
+            // limits:复刻 ruffle request_device(GLES3 起步 → 抬到适配器上限),仅多封顶纹理尺寸。
+            let mut limits = wgpu::Limits::downlevel_webgl2_defaults();
+            limits = limits.using_resolution(adapter.limits());
+            limits = limits.using_alignment(adapter.limits());
+            limits.max_uniform_buffer_binding_size = adapter.limits().max_uniform_buffer_binding_size;
+            limits.max_inter_stage_shader_components = adapter.limits().max_inter_stage_shader_components;
+            limits.max_color_attachments = 4;
+            limits.max_texture_dimension_2d = limits.max_texture_dimension_2d.min(4096);
+
+            let mut features = wgpu::Features::empty();
+            for feature in [
+                wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+                wgpu::Features::TEXTURE_COMPRESSION_BC,
+                wgpu::Features::FLOAT32_FILTERABLE,
+            ] {
+                if adapter.features().contains(feature) {
+                    features |= feature;
+                }
+            }
+
+            let (device, queue) = futures::executor::block_on(adapter.request_device(
+                &wgpu::DeviceDescriptor {
+                    label: None,
+                    required_features: features,
+                    required_limits: limits,
+                    memory_hints: wgpu::MemoryHints::MemoryUsage, // ★ 省分配器冗余
+                    trace: wgpu::Trace::Off,
+                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
+                },
+            ))
+            .expect("创建 wgpu device 失败");
+
+            let descriptors = Descriptors::new(instance, adapter, device, queue);
+            let target =
+                SwapChainTarget::new(surface, &descriptors.adapter, (width, height), &descriptors.device);
+            let backend = WgpuRenderBackend::new(std::sync::Arc::new(descriptors), target)
+                .expect("创建 wgpu 渲染后端失败");
+            (backend, render_api)
+        };
 
         let content = Rc::new(PlayingContent::DirectFile(ContentDescriptor::new_remote(
             mole::game_swf_url(),
@@ -222,13 +336,69 @@ impl App {
             mole::set_mole_fonts(&mut p);
             p.fetch_root_movie(mole::GAME_SWF_URL.to_string(), vec![], Box::new(|_| {}));
         }
-        (player, kbd)
+        (player, kbd, render_api)
     }
 
     fn with_player<R>(&self, f: impl FnOnce(&mut Player) -> R) -> Option<R> {
         let player = self.player.as_ref()?;
         let mut guard = player.lock().expect("player lock");
         Some(f(&mut guard))
+    }
+
+    /// iOS 内存观测 + 自适应守卫 + 刷新调试 HUD(时间驱动,在 about_to_wait 每 ~0.5s 调一次)。
+    /// `since` = 距上次调用的间隔,用于算实时 FPS(渲染帧数差 / 间隔)。
+    /// 守卫:余量跌破 SOFT/URGENT 阈值就主动重置纹理池(set_viewport 同尺寸 → TexturePool::new()
+    /// 释放累积的 ~1GB 池纹理),把进程锁在墙下。
+    #[cfg(target_os = "ios")]
+    fn mem_hud_tick(&mut self, since: Duration) {
+        let avail = mole::mem::available_mb().unwrap_or(0);
+        let foot = mole::mem::footprint_mb().unwrap_or(0);
+        let total = mole::mem::total_ram_mb();
+
+        // 实时 FPS:这段时间真正渲染的帧数 / 间隔(锁帧后挂机近 0、有动画约 24-30)。
+        let dframes = self.frames.saturating_sub(self.last_hud_frames);
+        self.last_hud_frames = self.frames;
+        let fps = if since.as_secs_f64() > 0.0 {
+            (dframes as f64 / since.as_secs_f64()).round() as u32
+        } else {
+            0
+        };
+
+        // 刷新 HUD 文本。
+        if let Some(hud) = &self.hud {
+            let text = format!(
+                "FPS {fps}\n内存 软件{foot} / 系统{total} MB\n余量 {avail} MB  温度 {temp}\n渲染 {api}\n网络 {net}   内核 {rev}",
+                temp = ios_debug_hud::thermal_state(),
+                api = self.render_api,
+                net = ios_debug_hud::network_status(),
+                rev = RUFFLE_REV,
+            );
+            hud.set_text(&text);
+        }
+
+        // 自适应内存守卫:余量低就主动回收纹理池。
+        if avail > 0 {
+            let urgent = avail < MEM_URGENT_MB;
+            let min_gap = if urgent { 2 } else { 6 };
+            if avail < MEM_SOFT_FLOOR_MB && self.last_pool_trim.elapsed().as_secs() >= min_gap {
+                if let Some(w) = self.window.clone() {
+                    let (width, height) = render_dims(&w);
+                    let scale_factor = w.scale_factor();
+                    self.with_player(|p| {
+                        p.set_viewport_dimensions(ViewportDimensions {
+                            width,
+                            height,
+                            scale_factor,
+                        });
+                    });
+                    self.last_pool_trim = Instant::now();
+                    tracing::warn!(
+                        "内存守卫{}:余量 {avail}MB → 重置纹理池回收(清前足迹 {foot}MB)",
+                        if urgent { "(急)" } else { "" }
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -266,9 +436,10 @@ impl ApplicationHandler<UserEvent> for App {
             sz.height,
             window.scale_factor()
         );
-        let (player, kbd) = self.build_player(window.clone());
+        let (player, kbd, render_api) = self.build_player(window.clone());
+        self.render_api = render_api;
         window.request_redraw();
-        // iOS:创建纯触摸复制/粘贴工具条(挂到 UIView,初始隐藏)
+        // iOS:创建纯触摸复制/粘贴工具条(挂到 UIView,初始隐藏)+ 绿色调试 HUD(挂到 UIView,常显)
         #[cfg(target_os = "ios")]
         {
             self.textbar = ios_textbar::TextBar::new(&window);
@@ -277,6 +448,8 @@ impl ApplicationHandler<UserEvent> for App {
             } else {
                 tracing::warn!("iOS 文本工具条创建失败");
             }
+            self.hud = ios_debug_hud::DebugHud::new(&window);
+            tracing::info!("iOS 调试 HUD {}", if self.hud.is_some() { "已创建" } else { "创建失败" });
         }
         self.window = Some(window);
         self.player = Some(player);
@@ -349,17 +522,10 @@ impl ApplicationHandler<UserEvent> for App {
                         });
                     }
                 }
-                let now = Instant::now();
-                let dt_ms = now.duration_since(self.last_tick).as_secs_f64() * 1000.0;
-                self.last_tick = now;
-                self.with_player(|p| {
-                    p.tick(FloatDuration::from_millis(dt_ms));
-                    p.render();
-                });
+                // 只渲染当前帧。tick 已移到 about_to_wait,按 SWF 帧率(摩尔庄园 ~24-30fps)推进,
+                // 且仅在 needs_render 时才会走到这里——不再按屏幕 60Hz 过度渲染,GPU/发热砍约一半。
+                self.with_player(|p| p.render());
                 self.frames += 1;
-                if self.frames % 60 == 1 {
-                    tracing::info!("render frame #{}", self.frames);
-                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = position;
@@ -501,8 +667,8 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
-    // Poll 下持续触发:推进 tokio 异步 + 请求下一帧(渲染在 RedrawRequested 做)
-    fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
+    // 锁帧驱动:推进 tokio 异步 + 按 SWF 帧率 tick + 仅脏时请求重绘 + 睡到下一帧(渲染在 RedrawRequested 做)
+    fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         enter_runtime!(self);
         // 软键盘 + iOS 文本工具条按需开关:Flash 文本框聚焦→标志 true→弹软键盘+显示工具条;失焦→收起。
         if let Some(kbd) = &self.kbd {
@@ -541,9 +707,35 @@ impl ApplicationHandler<UserEvent> for App {
             });
             tracing::info!("UIPasteControl→粘贴已注入");
         }
-        if let Some(w) = &self.window {
-            w.request_redraw();
+        // 帧率锁定 + 脏标记:按 SWF 帧率 tick,只在内容真变化(needs_render)时请求重绘,然后睡到下一帧。
+        // 摩尔庄园 ~24-30fps,屏幕 60Hz 时这砍掉约一半 GPU/发热;挂机/对话框近乎 0 重绘。
+        let now = Instant::now();
+        let dt_ms = now.duration_since(self.last_tick).as_secs_f64() * 1000.0;
+        self.last_tick = now;
+        let (needs_render, til) = self
+            .with_player(|p| {
+                p.tick(FloatDuration::from_millis(dt_ms));
+                (p.needs_render(), p.time_til_next_frame())
+            })
+            .unwrap_or((false, Duration::from_millis(16)));
+        if needs_render {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
         }
+
+        // 内存观测 + 自适应守卫 + 刷新调试 HUD:时间驱动(锁帧后空闲帧计数会停,故按 ~0.5s 间隔评估)。
+        #[cfg(target_os = "ios")]
+        {
+            let since = self.last_mem_check.elapsed();
+            if since.as_millis() >= 500 {
+                self.last_mem_check = now;
+                self.mem_hud_tick(since);
+            }
+        }
+
+        // 睡到下一 SWF 帧(或被输入/异步事件提前唤醒),替代原来的 Poll 满速空转。
+        el.set_control_flow(ControlFlow::WaitUntil(now + til));
     }
 }
 

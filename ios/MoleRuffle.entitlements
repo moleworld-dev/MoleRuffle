@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- 提升单 app 内存上限:摩尔庄园进游戏世界/切场景峰值显存逼近 iOS 默认 ~3.4GB per-process 墙
+         (真机 JetsamEvent 实测 3386MB per-process-limit 被杀)。此 entitlement 把上限抬到设备物理内存
+         的 ~75%(12GB 机型 ≈ ~9GB),让全原生分辨率渲染 + 切场景峰值都有充裕余量,不再被 signal 9 杀。
+         它是免费布尔键:无需 Apple 审批、无需 App ID 能力,dev 与 App Store 构建都直接签入(iOS 15+)。
+         实际授予额度运行时用 os_proc_available_memory() 读取(见 moleruffle-core mem 模块)。 -->
+    <key>com.apple.developer.kernel.increased-memory-limit</key>
+    <true/>
+</dict>
+</plist>
