@@ -10,8 +10,10 @@
 //! socket(游戏服 123.206.131.236:1865 的实时协议)走 `connect_socket`,天然不经此缓存。
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
@@ -24,9 +26,14 @@ use ruffle_core::loader::Error;
 use ruffle_core::socket::{SocketAction, SocketHandle};
 use url::{ParseError, Url};
 
-/// 给 `ExternalNavigatorBackend` 套上本地资源缓存。
+/// 失败重试次数(总尝试 = RETRIES + 1)。只对幂等 GET 生效。抖动网络下瞬时超时重试一次往往就成。
+const RETRIES: u32 = 2;
+
+/// 给 `ExternalNavigatorBackend` 套上本地资源缓存 + GET 重试。
+/// 内层包 `Rc<RefCell<N>>`:重试需要在异步过程里重新发起请求,借此绕开 `&self` 的生命周期约束
+/// (借用只在同步的 `fetch()`/`borrow_mut()` 调用期间持有,绝不跨 await)。
 pub struct CachingNavigator<N> {
-    inner: N,
+    inner: Rc<RefCell<N>>,
     cache_dir: PathBuf,
 }
 
@@ -35,7 +42,10 @@ impl<N> CachingNavigator<N> {
     pub fn new(inner: N, cache_dir: PathBuf) -> Self {
         let _ = std::fs::create_dir_all(&cache_dir);
         tracing::info!("资源缓存目录: {}", cache_dir.display());
-        Self { inner, cache_dir }
+        Self {
+            inner: Rc::new(RefCell::new(inner)),
+            cache_dir,
+        }
     }
 
     /// URL → 缓存文件路径(对完整 URL 取稳定 hash,按前两位分桶,避免单目录文件过多)。
@@ -73,58 +83,96 @@ fn write_cache_atomic(path: &PathBuf, bytes: &[u8]) {
 
 impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
     fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
-        if !is_cacheable(&request) {
-            return self.inner.fetch(request);
+        // 非 GET(POST 等)不幂等:既不缓存也不重试,原样透传(重试 POST 会重复提交)。
+        if request.method() != NavigationMethod::Get {
+            return self.inner.borrow().fetch(request);
         }
+
         let url = request.url().to_string();
-        let path = self.cache_path(&url);
+        let cacheable = is_cacheable(&request);
+        let cache_path = cacheable.then(|| self.cache_path(&url));
 
-        // 命中:直接读盘返回(免网络,秒开)
-        if let Ok(bytes) = std::fs::read(&path) {
-            tracing::debug!("缓存命中: {url}");
-            return Box::pin(async move {
-                Ok(Box::new(CachedResponse::new(url, bytes)) as Box<dyn SuccessResponse>)
-            });
+        // 缓存命中:直接读盘返回(免网络,秒开)
+        if let Some(path) = &cache_path {
+            if let Ok(bytes) = std::fs::read(path) {
+                tracing::debug!("缓存命中: {url}");
+                let u = url.clone();
+                return Box::pin(async move {
+                    Ok(Box::new(CachedResponse::new(u, bytes)) as Box<dyn SuccessResponse>)
+                });
+            }
         }
 
-        // 未命中:走内层网络,成功(200)则存盘,再以同样字节返回
-        let inner_fut = self.inner.fetch(request);
+        // 未命中:走网络。GET 幂等,失败/超时重试 RETRIES 次;成功且可缓存(200)则存盘。
+        let inner = self.inner.clone();
+        let headers = request.headers().clone();
         Box::pin(async move {
-            let resp = inner_fut.await?;
-            if resp.status() != 200 {
-                return Ok(resp); // 非 200(404/302 等)不缓存
+            let mut attempt = 0u32;
+            loop {
+                // 每次尝试重建一个 GET 请求(原请求已被上一次 fetch 消费)
+                let mut req = Request::get(url.clone());
+                req.set_headers(headers.clone());
+                // 借用只在同步的 fetch() 调用期间持有,拿到 future 后立刻释放,绝不跨 await
+                let fut = inner.borrow().fetch(req);
+                match fut.await {
+                    Ok(resp) => {
+                        let Some(path) = &cache_path else {
+                            return Ok(resp); // 可重试但不缓存(如 account.61.com 的 GET)
+                        };
+                        if resp.status() != 200 {
+                            return Ok(resp); // 非 200 不缓存,原样返回
+                        }
+                        let final_url = resp.url().to_string();
+                        match resp.body().await {
+                            Ok(bytes) => {
+                                write_cache_atomic(path, &bytes);
+                                tracing::debug!("缓存写入: {url} ({} 字节)", bytes.len());
+                                return Ok(Box::new(CachedResponse::new(final_url, bytes))
+                                    as Box<dyn SuccessResponse>);
+                            }
+                            Err(error) => {
+                                if attempt < RETRIES {
+                                    attempt += 1;
+                                    tracing::debug!("读 body 失败,重试 {attempt}/{RETRIES}: {url}");
+                                    continue;
+                                }
+                                return Err(ErrorResponse { url, error });
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        if attempt < RETRIES {
+                            attempt += 1;
+                            tracing::debug!("拉取失败,重试 {attempt}/{RETRIES}: {url}");
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                }
             }
-            let final_url = resp.url().to_string();
-            let bytes = resp
-                .body()
-                .await
-                .map_err(|error| ErrorResponse { url: url.clone(), error })?;
-            write_cache_atomic(&path, &bytes);
-            tracing::debug!("缓存写入: {url} ({} 字节)", bytes.len());
-            Ok(Box::new(CachedResponse::new(final_url, bytes)) as Box<dyn SuccessResponse>)
         })
     }
 
-    // ── 其余方法全部透传给内层 ──
+    // ── 其余方法全部透传给内层(借用仅在调用期间)──
     fn navigate_to_url(
         &self,
         url: &str,
         target: &str,
         vars_method: Option<(NavigationMethod, IndexMap<String, String>)>,
     ) {
-        self.inner.navigate_to_url(url, target, vars_method)
+        self.inner.borrow().navigate_to_url(url, target, vars_method)
     }
 
     fn resolve_url(&self, url: &str) -> Result<Url, ParseError> {
-        self.inner.resolve_url(url)
+        self.inner.borrow().resolve_url(url)
     }
 
     fn spawn_future(&mut self, future: OwnedFuture<(), Error>) {
-        self.inner.spawn_future(future)
+        self.inner.borrow_mut().spawn_future(future)
     }
 
     fn pre_process_url(&self, url: Url) -> Url {
-        self.inner.pre_process_url(url)
+        self.inner.borrow().pre_process_url(url)
     }
 
     fn connect_socket(
@@ -137,6 +185,7 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
         sender: Sender<SocketAction>,
     ) {
         self.inner
+            .borrow_mut()
             .connect_socket(host, port, timeout, handle, receiver, sender)
     }
 }
