@@ -100,6 +100,8 @@ struct App {
     render_api: String,
     /// 上次 HUD 取样时的渲染帧数,用于算实时 FPS。
     last_hud_frames: u64,
+    /// 上次 HUD 取样时的累计逐出数,用于算每秒逐出数。
+    last_evict: u64,
     /// iOS 绿色调试 HUD(左上角实时 FPS/内存/网络/渲染API/内核/温度)。
     #[cfg(target_os = "ios")]
     hud: Option<ios_debug_hud::DebugHud>,
@@ -206,6 +208,7 @@ impl App {
             textbar: None,
             render_api: String::from("?"),
             last_hud_frames: 0,
+            last_evict: 0,
             #[cfg(target_os = "ios")]
             hud: None,
         })
@@ -364,10 +367,18 @@ impl App {
             0
         };
 
+        // 常驻库位图纹理数/显存 + 每秒逐出数(来自 fork 的 ruffle_render::evict 计数器)。
+        use std::sync::atomic::Ordering::Relaxed;
+        let res_tex = ruffle_render::evict::RESIDENT_TEXTURES.load(Relaxed);
+        let res_mb = ruffle_render::evict::RESIDENT_BYTES.load(Relaxed) / (1024 * 1024);
+        let ev_total = ruffle_render::evict::EVICTIONS_TOTAL.load(Relaxed);
+        let ev_s = (ev_total.saturating_sub(self.last_evict)) as f64 / since.as_secs_f64().max(0.001);
+        self.last_evict = ev_total;
+
         // 刷新 HUD 文本。
         if let Some(hud) = &self.hud {
             let text = format!(
-                "FPS {fps}\n内存 软件{foot} / 系统{total} MB\n余量 {avail} MB  温度 {temp}\n渲染 {api}\n网络 {net}   内核 {rev}",
+                "FPS {fps}\n内存 软件{foot} / 系统{total} MB\n余量 {avail} MB  温度 {temp}\n渲染 {api}\n常驻 {res_tex} 张 / {res_mb} MB  逐出 {ev_s:.0}/s\n网络 {net}   内核 {rev}",
                 temp = ios_debug_hud::thermal_state(),
                 api = self.render_api,
                 net = ios_debug_hud::network_status(),
@@ -748,6 +759,9 @@ fn main() -> anyhow::Result<()> {
         tracing_subscriber::EnvFilter::new("warn,winit=error,ruffle=info,avm_trace=info,moleruffle=info")
     });
     tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    // 纹理逐出开关:读 MOLE_TEXTURE_EVICT(Phase 1 不设=保持关=行为同现状)。
+    ruffle_render::evict::init_from_env();
 
     tracing::info!("MoleRuffle 桌面端启动,加载 {}", mole::GAME_SWF_URL);
 

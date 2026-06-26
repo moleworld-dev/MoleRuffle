@@ -49,3 +49,28 @@ strip = true          # 瘦身(不影响帧率);不加 panic="abort":Ruffle 用 
 # 本 workspace 的 crate 仍 opt-level=0(编译快、可调试)。
 [profile.dev.package."*"]
 opt-level = 3
+
+# ───────────────────────────────────────────────────────────────────────────
+# 【可一键回退】本地 Ruffle fork:把所有出自 ruffle git 源的 crate 重定向到本地克隆
+# (../ruffle-fork,纯净基线 = pin 的 304a3c9)。用于自研纹理驻留/逐出省内存。
+# 必须覆盖 Cargo.lock 中所有 git+ruffle 的 crate(共 15),漏一个会出现两份 ruffle_core
+# → "expected struct X found struct X" 诡异编译错。当前 fork 是逐字节纯净拷贝,接上后
+# 编译产物应与纯 pin 一致(零行为改动),先验证管线;之后再在 fork 内分阶段改。
+# 回退:删掉整个 [patch.*] 段 + `cargo build` 即回到纯净 pin。
+# ───────────────────────────────────────────────────────────────────────────
+[patch."https://github.com/ruffle-rs/ruffle"]
+swf                   = { path = "../ruffle-fork/swf" }
+ruffle_common         = { path = "../ruffle-fork/core/common" }
+ruffle_core           = { path = "../ruffle-fork/core" }
+ruffle_macros         = { path = "../ruffle-fork/core/macros" }
+ruffle_render         = { path = "../ruffle-fork/render" }
+ruffle_render_wgpu    = { path = "../ruffle-fork/render/wgpu" }
+ruffle_video          = { path = "../ruffle-fork/video" }
+ruffle_wstr           = { path = "../ruffle-fork/wstr" }
+ruffle_frontend_utils = { path = "../ruffle-fork/frontend-utils" }
+naga-agal             = { path = "../ruffle-fork/render/naga-agal" }
+naga-pixelbender      = { path = "../ruffle-fork/render/naga-pixelbender" }
+pixel_bender          = { path = "../ruffle-fork/render/pixel_bender" }
+flv-rs                = { path = "../ruffle-fork/flv" }
+asc                   = { path = "../ruffle-fork/tools/asc" }
+build_playerglobal    = { path = "../ruffle-fork/core/build_playerglobal" }
