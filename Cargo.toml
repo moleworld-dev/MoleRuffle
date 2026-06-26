@@ -34,6 +34,9 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1.0"
+# 各平台标准数据目录(桌面=各自数据目录;iOS=沙盒内 Library/Application Support,
+# 重启/更新保留)。用于 SharedObject(“记住账号”等)磁盘持久化。
+dirs = "6"
 
 [profile.release]
 # 引擎是 AVM 解释器,优化等级对手机帧率影响大
