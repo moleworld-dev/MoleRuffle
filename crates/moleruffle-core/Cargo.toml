@@ -11,3 +11,6 @@ ruffle_core.workspace = true
 ruffle_frontend_utils.workspace = true
 url.workspace = true
 tracing.workspace = true
+# 设备字体:用系统字体库(mac=PingFang / win=YaHei / iOS=PingFang / Android=Noto CJK)
+fontdb = "0.23"
+unic-langid = "0.9"
