@@ -2435,8 +2435,11 @@ name = "moleruffle-core"
 version = "0.1.0"
 dependencies = [
  "arboard",
+ "async-channel",
  "dirs",
+ "encoding_rs",
  "fontdb",
+ "indexmap",
  "objc2-foundation 0.2.2",
  "objc2-ui-kit",
  "ruffle_core",

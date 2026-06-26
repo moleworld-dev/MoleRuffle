@@ -111,12 +111,13 @@ fn surface_dims(window: &Window) -> (u32, u32) {
     (s.width.max(1), s.height.max(1))
 }
 
-/// 渲染降采样系数。iOS 真机渲染全屏物理像素(如 2868×1320)+ MSAA 显存/填充率会触发
-/// jetsam(进游戏世界 SIGKILL)。摩尔庄园源美术仅 960×560,没必要按屏幕原生像素硬渲染:
-/// 把 wgpu surface / 引擎 viewport 缩到 ×RENDER_SCALE,CAMetalLayer 再线性放大铺满全屏,
-/// 显存/填充率约降到 1/(scale²),视觉几乎无感(源分辨率低)。桌面窗口小,不缩(=1.0)。
+/// 渲染降采样系数。iOS 真机渲染全屏物理像素(如 2868×1320)。注意:进游戏世界的 SIGKILL(OOM)
+/// 主要是 **MSAA**(离屏滤镜/cacheAsBitmap 目标按采样数倍增显存)——已用 StageQuality::Low 关掉,
+/// 那才是救命的一刀;render_scale 只缩主屏 framebuffer(占用很小、不碰离屏目标),对 OOM 贡献有限。
+/// 之前 0.6 砍掉了清晰度却换不来多少内存,反而画面/字体「纸糊」。故调回 **1.0 全原生分辨率**(真高清),
+/// 内存靠关 MSAA 守住。若个别机型仍紧或要更高帧率,可微降到 0.85(2438×1122,仍远超 960×560 源美术)。
 #[cfg(target_os = "ios")]
-const RENDER_SCALE: f64 = 0.6;
+const RENDER_SCALE: f64 = 1.0;
 #[cfg(not(target_os = "ios"))]
 const RENDER_SCALE: f64 = 1.0;
 
@@ -189,6 +190,9 @@ impl App {
             content,
             mole::MoleNavigatorInterface,
         );
+        // ★ 本地资源缓存(CDN 思路):静态资源 SWF/图片缓存到磁盘,二次加载秒开且免网络,
+        //   缓解 mole.61.com 慢/抖动导致的"维护"与每次重下。socket/登录动态请求不走缓存。
+        let navigator = mole::CachingNavigator::new(navigator, mole::cache_dir());
 
         // 设备字体后端:系统字体 + 中文回退;并取软键盘标志(文本框聚焦时弹键盘)
         let ui = mole::MoleUiBackend::with_system_fonts();
