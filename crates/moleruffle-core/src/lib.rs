@@ -10,7 +10,7 @@
 //! (window/render/audio/future-spawner),其余统一调用这里。
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ruffle_core::backend::ui::{
@@ -22,6 +22,7 @@ use ruffle_core::font::{DefaultFont, FontFileData, FontQuery};
 use ruffle_core::{LoadBehavior, Player, PlayerBuilder, StageScaleMode};
 use ruffle_render::quality::StageQuality;
 use ruffle_frontend_utils::backends::navigator::NavigatorInterface;
+use ruffle_frontend_utils::backends::storage::DiskStorageBackend;
 use unic_langid::LanguageIdentifier;
 use url::Url;
 
@@ -58,13 +59,19 @@ pub fn game_base_url() -> Url {
 /// 这是五端共享的关键装配:平台壳层先 `with_renderer/with_audio/with_navigator`,
 /// 再调本函数补齐摩尔庄园需要的设置(尤其是 spoof,缺了它进不去游戏)。
 pub fn apply_mole_settings(builder: PlayerBuilder) -> PlayerBuilder {
+    // 画质/MSAA:iOS 真机关 MSAA(Low=1x)。Apple GPU 最大 4x MSAA,High8x8 在真机被钳到 4x、
+    // 仍要按全屏物理像素(~2868×1320)分配 ~90MB+ MSAA framebuffer,且乘进每个滤镜/cacheAsBitmap
+    // 离屏目标 → 进游戏世界叠纹理超 iOS jetsam 内存上限被 SIGKILL(实测真机闪退)。关 MSAA + 壳层
+    // render_scale 降采样后显存大降。摩尔庄园源美术仅 960×560,关 MSAA 视觉几乎无感。桌面窗口小,
+    // 保留 High8x8 高画质。
+    #[cfg(target_os = "ios")]
+    let quality = StageQuality::Low;
+    #[cfg(not(target_os = "ios"))]
+    let quality = StageQuality::High8x8;
     builder
         .with_autoplay(true)
         .with_letterbox(Letterbox::On)
-        // ★ 画质拉满:8x MSAA(矢量边缘抗锯齿)。默认是 High=4x;High8x8=8x,GPU 不支持时
-        //   wgpu 后端会自动回落(supported_sample_count 减半),不会崩。位图(游戏美术)清晰度
-        //   靠 smoothing(默认开,双线性)+ 渲染分辨率(壳层已传屏幕原生物理像素=显示上限)。
-        .with_quality(StageQuality::High8x8)
+        .with_quality(quality)
         // ★ 强制 ShowAll:摩尔庄园舞台固定 960x560 且用 NoScale(老 Flash 游戏惯例),
         //   在手机/缩放窗口上会溢出屏幕。强制 ShowAll(force=true)把整个舞台等比缩放
         //   letterbox 适配任意屏幕尺寸,无视 SWF 自设的 scaleMode。
@@ -76,6 +83,47 @@ pub fn apply_mole_settings(builder: PlayerBuilder) -> PlayerBuilder {
         .with_page_url(Some(SPOOF_URL.to_string()))
         // 伪装成较新的 Flash Player 版本(摩尔庄园按 plugin 版本判断兼容)
         .with_player_version(Some(32))
+}
+
+/// 摩尔庄园本地存储(Flash `SharedObject` / `.sol`)的磁盘根目录。
+///
+/// 没有它,`PlayerBuilder` 默认装的是 `MemoryStorageBackend`(纯内存,见 ruffle
+/// `core/src/player.rs:2975`),进程一退所有 `SharedObject` 全丢——登录页“记住账号”
+/// 勾了也白勾,重启就没了。这里给出各端**可写、且重启/更新后仍保留**的目录:
+///
+///   - 桌面:`dirs::data_local_dir()`(mac=`~/Library/Application Support`,
+///     win=`%LOCALAPPDATA%`,linux=`~/.local/share`)/MoleRuffle/SharedObjects
+///   - iOS:`dirs::data_local_dir()` 在沙盒里就是 `$HOME/Library/Application Support`
+///     ($HOME = app 容器根);Application Support 不对用户可见、不进 iCloud 文档,
+///     是放 app 私有数据的标准位置,App 更新保留、仅卸载时清除(符合预期)。
+///   - Android:`~/.local/share`(壳层若拿到 app filesDir 可改传绝对路径,见
+///     [`attach_storage_at`])。
+///
+/// `DiskStorageBackend` 会在此目录下按 `{host}/{swf}/{name}.sol` 落盘
+/// (摩尔庄园即 `mole.61.com/Client.swf/<名字>.sol`),目录不存在会自动创建。
+pub fn mole_storage_dir() -> PathBuf {
+    let base = dirs::data_local_dir().unwrap_or_else(|| {
+        // 极少数环境拿不到标准数据目录时,退到 HOME(再退到当前目录),保证仍是磁盘持久化。
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+    });
+    base.join("MoleRuffle").join("SharedObjects")
+}
+
+/// 给 `PlayerBuilder` 装上指向 `dir` 的磁盘存储后端([`DiskStorageBackend`])。
+///
+/// 平台壳如果能拿到更合适的可写目录(如 Android 的 app `filesDir`),
+/// 直接传进来即可;否则用 [`attach_storage`] 走默认目录。
+pub fn attach_storage_at(builder: PlayerBuilder, dir: PathBuf) -> PlayerBuilder {
+    tracing::info!("SharedObject 存储目录: {}", dir.display());
+    builder.with_storage(Box::new(DiskStorageBackend::new(dir)))
+}
+
+/// 给 `PlayerBuilder` 装上磁盘存储后端,目录用 [`mole_storage_dir`](各端默认数据目录)。
+///
+/// 五端壳层在 `apply_mole_settings` 之后(或之前皆可,`with_storage` 只是覆盖默认)
+/// 调用一次,`SharedObject`(记住账号/各类本地存档)就会持久化到磁盘,重启不丢。
+pub fn attach_storage(builder: PlayerBuilder) -> PlayerBuilder {
+    attach_storage_at(builder, mole_storage_dir())
 }
 
 /// 设置中文字体回退链。
@@ -162,6 +210,11 @@ const FONT_FALLBACKS: &[&str] = &[
     "Arial Unicode MS",
     "Hiragino Sans GB",
 ];
+
+/// 打包进二进制的中文+拉丁兜底字体(STHeiti 子集:ASCII+标点+全部常用汉字+假名,~11MB)。
+/// iOS 真机沙盒读不到系统中文字体、fontdb 按名查全失败时用它,保证动态文本不缺字。
+/// `include_bytes!` 把字节编进 .rodata;`FontFileData::new(BUNDLED_FONT)` 对 &'static 切片零拷贝。
+const BUNDLED_FONT: &[u8] = include_bytes!("../assets/molefont.ttf");
 
 /// MoleRuffle 的 `UiBackend`。
 ///
@@ -255,14 +308,26 @@ impl UiBackend for MoleUiBackend {
         if self.try_register(&query.name, query, register) {
             return;
         }
-        // 2) 退到带中文的字体,保证中文不丢
+        // 2) 退到系统里带中文的字体(macOS/Windows 通常命中)
         for fallback in FONT_FALLBACKS {
             if self.try_register(fallback, query, register) {
                 tracing::debug!("字体 '{}' 回退到 '{}'", query.name, fallback);
                 return;
             }
         }
-        tracing::warn!("字体 '{}' 无可用回退", query.name);
+        // 3) ★ 最终兜底:用**打包进二进制**的 CJK+拉丁字体。iOS 真机沙盒读不到
+        //    /System/Library/Fonts/Core(PingFang 等),fontdb 按名查全失败 → 上面两步都不命中,
+        //    动态文本(玩家名/聊天/系统提示)会缺字/渲染异常。打包字体保证任何 device font 请求
+        //    (含 'Tahoma' 等)都有可用字形。FontFileData::new 对 &'static 切片零拷贝(11MB 留在
+        //    .rodata,只包一个小 Arc 指针),所有名字共享同一份字节。
+        register(FontDefinition::FontFile {
+            name: query.name.clone(),
+            is_bold: query.is_bold,
+            is_italic: query.is_italic,
+            data: FontFileData::new(BUNDLED_FONT),
+            index: 0,
+        });
+        tracing::debug!("字体 '{}' 用打包字体兜底", query.name);
     }
 
     fn mouse_visible(&self) -> bool {

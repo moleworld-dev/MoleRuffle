@@ -111,6 +111,30 @@ fn surface_dims(window: &Window) -> (u32, u32) {
     (s.width.max(1), s.height.max(1))
 }
 
+/// 渲染降采样系数。iOS 真机渲染全屏物理像素(如 2868×1320)+ MSAA 显存/填充率会触发
+/// jetsam(进游戏世界 SIGKILL)。摩尔庄园源美术仅 960×560,没必要按屏幕原生像素硬渲染:
+/// 把 wgpu surface / 引擎 viewport 缩到 ×RENDER_SCALE,CAMetalLayer 再线性放大铺满全屏,
+/// 显存/填充率约降到 1/(scale²),视觉几乎无感(源分辨率低)。桌面窗口小,不缩(=1.0)。
+#[cfg(target_os = "ios")]
+const RENDER_SCALE: f64 = 0.6;
+#[cfg(not(target_os = "ios"))]
+const RENDER_SCALE: f64 = 1.0;
+
+/// 喂给 wgpu surface / 引擎 viewport 的渲染尺寸(物理像素 × RENDER_SCALE)。
+/// 注意:**触摸坐标也必须 ×RENDER_SCALE** 才与缩小后的 viewport 一致(见 Touch 处理),
+/// 否则重蹈"viewport 与触摸坐标空间不一致 → 触摸偏移"的坑。
+/// iOS 文本工具条是叠在**全屏** UIView 上的原生层,其布局/命中仍用未缩放的 `surface_dims`。
+fn render_dims(window: &Window) -> (u32, u32) {
+    let (w, h) = surface_dims(window);
+    if RENDER_SCALE == 1.0 {
+        return (w, h);
+    }
+    (
+        ((w as f64 * RENDER_SCALE).max(1.0)) as u32,
+        ((h as f64 * RENDER_SCALE).max(1.0)) as u32,
+    )
+}
+
 impl App {
     fn new(proxy: EventLoopProxy<UserEvent>) -> anyhow::Result<Self> {
         Ok(Self {
@@ -133,7 +157,8 @@ impl App {
     }
 
     fn build_player(&self, window: Arc<Window>) -> (Arc<Mutex<Player>>, Arc<AtomicBool>) {
-        let (width, height) = surface_dims(&window);
+        // 渲染尺寸用 render_dims(iOS 已 ×RENDER_SCALE 降采样,省显存避免 jetsam)
+        let (width, height) = render_dims(&window);
 
         let renderer = unsafe {
             WgpuRenderBackend::for_window_unsafe(
@@ -177,6 +202,10 @@ impl App {
             Err(e) => tracing::warn!("无音频后端: {e}"),
         }
         builder = mole::apply_mole_settings(builder);
+        // ★ 磁盘存储后端:不装的话 PlayerBuilder 默认用 MemoryStorageBackend(纯内存),
+        //   Flash SharedObject(登录页“记住账号”等)进程一退就丢、重启不保存。
+        //   指向各端可写且重启/更新保留的数据目录(iOS=沙盒 Library/Application Support)。
+        builder = mole::attach_storage(builder);
 
         let player = builder.build();
         {
@@ -274,14 +303,14 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Resized(_size) => {
-                // 忽略事件携带的 size(iOS 上可能是安全区/全屏不一致),统一用 surface_dims。
+                // 忽略事件携带的 size(iOS 上可能是安全区/全屏不一致),统一用 render_dims(已降采样)。
                 if let Some(w) = &self.window {
-                    let (width, height) = surface_dims(w);
+                    let (width, height) = render_dims(w);
                     let scale = w.scale_factor();
                     let inner = w.inner_size();
                     self.viewport = (width, height);
                     tracing::info!(
-                        "Resized: surface={}x{} (inner={}x{}) scale={}",
+                        "Resized: render={}x{} (inner={}x{}) scale={}",
                         width, height, inner.width, inner.height, scale
                     );
                     self.with_player(|p| {
@@ -298,13 +327,13 @@ impl ApplicationHandler<UserEvent> for App {
                 // 每帧同步真实绘制尺寸:iOS 上 resumed 时拿到的尺寸可能是布局未稳的过渡值,
                 // 且旋转/布局变化不一定发干净的 Resized,这里轮询纠正,避免 UI 溢出/缩放错/触摸偏移。
                 if let Some(w) = &self.window {
-                    let (width, height) = surface_dims(w);
+                    let (width, height) = render_dims(w);
                     let scale = w.scale_factor();
                     if (width, height) != self.viewport && width > 0 && height > 0 {
                         self.viewport = (width, height);
                         let inner = w.inner_size();
                         tracing::info!(
-                            "viewport 同步 surface={}x{} (inner={}x{}) scale={}",
+                            "viewport 同步 render={}x{} (inner={}x{}) scale={}",
                             width, height, inner.width, inner.height, scale
                         );
                         self.with_player(|p| {
@@ -332,8 +361,8 @@ impl ApplicationHandler<UserEvent> for App {
                 self.mouse_pos = position;
                 self.with_player(|p| {
                     p.handle_event(PlayerEvent::MouseMove {
-                        x: position.x,
-                        y: position.y,
+                        x: position.x * RENDER_SCALE,
+                        y: position.y * RENDER_SCALE,
                     })
                 });
             }
@@ -369,6 +398,9 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
                 }
+                // 游戏用缩放后的坐标:viewport 已 ×RENDER_SCALE,触摸(全屏物理像素)也必须同比缩,
+                // 否则触摸空间(全屏)≠ viewport(缩小)→ 又触摸偏移。工具条命中已在上面用全屏坐标判过。
+                let (x, y) = (x * RENDER_SCALE, y * RENDER_SCALE);
                 self.with_player(|p| match phase {
                     TouchPhase::Started => {
                         p.handle_event(PlayerEvent::MouseMove { x, y });
@@ -402,7 +434,7 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseButton::Middle => RuffleButton::Middle,
                     _ => RuffleButton::Unknown,
                 };
-                let (x, y) = (self.mouse_pos.x, self.mouse_pos.y);
+                let (x, y) = (self.mouse_pos.x * RENDER_SCALE, self.mouse_pos.y * RENDER_SCALE);
                 let ev = match state {
                     ElementState::Pressed => PlayerEvent::MouseDown {
                         x,

@@ -12,6 +12,8 @@ ruffle_render.workspace = true   # StageQuality(画质/MSAA 档位)
 ruffle_frontend_utils.workspace = true
 url.workspace = true
 tracing.workspace = true
+# SharedObject(“记住账号”等本地存储)磁盘持久化的目录定位(五端通用)
+dirs.workspace = true
 # 设备字体:用系统字体库(mac=PingFang / win=YaHei / iOS=PingFang / Android=Noto CJK)
 fontdb = "0.23"
 unic-langid = "0.9"
