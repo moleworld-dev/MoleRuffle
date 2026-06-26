@@ -19,7 +19,7 @@ use ruffle_core::backend::ui::{
 };
 use ruffle_core::config::Letterbox;
 use ruffle_core::font::{DefaultFont, FontFileData, FontQuery};
-use ruffle_core::{LoadBehavior, Player, PlayerBuilder};
+use ruffle_core::{LoadBehavior, Player, PlayerBuilder, StageScaleMode};
 use ruffle_frontend_utils::backends::navigator::NavigatorInterface;
 use unic_langid::LanguageIdentifier;
 use url::Url;
@@ -60,6 +60,10 @@ pub fn apply_mole_settings(builder: PlayerBuilder) -> PlayerBuilder {
     builder
         .with_autoplay(true)
         .with_letterbox(Letterbox::On)
+        // ★ 强制 ShowAll:摩尔庄园舞台固定 960x560 且用 NoScale(老 Flash 游戏惯例),
+        //   在手机/缩放窗口上会溢出屏幕。强制 ShowAll(force=true)把整个舞台等比缩放
+        //   letterbox 适配任意屏幕尺寸,无视 SWF 自设的 scaleMode。
+        .with_scale_mode(StageScaleMode::ShowAll, true)
         // 边下边跑:数百个资源 SWF 是运行时陆续拉的
         .with_load_behavior(LoadBehavior::Streaming)
         // ★ 域名守卫 spoof:让 Client.swf 以为自己就在官网上,不要 navigateToURL 弹走
@@ -163,6 +167,8 @@ const FONT_FALLBACKS: &[&str] = &[
 #[derive(Clone)]
 pub struct MoleUiBackend {
     fonts: Arc<fontdb::Database>,
+    /// 应用内剪贴板兜底(移动端无系统剪贴板时用;桌面也作镜像)。
+    clip: Arc<std::sync::Mutex<String>>,
 }
 
 impl MoleUiBackend {
@@ -186,6 +192,7 @@ impl MoleUiBackend {
         tracing::info!("MoleUiBackend: 载入 {} 个字体面", db.len());
         Self {
             fonts: Arc::new(db),
+            clip: Arc::new(std::sync::Mutex::new(String::new())),
         }
     }
 
@@ -250,9 +257,28 @@ impl UiBackend for MoleUiBackend {
     fn set_mouse_visible(&mut self, _visible: bool) {}
     fn set_mouse_cursor(&mut self, _cursor: MouseCursor) {}
     fn clipboard_content(&mut self) -> String {
-        String::new()
+        // 桌面:读系统剪贴板;失败或移动端:用应用内兜底
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                if let Ok(text) = cb.get_text() {
+                    return text;
+                }
+            }
+        }
+        self.clip.lock().map(|s| s.clone()).unwrap_or_default()
     }
-    fn set_clipboard_content(&mut self, _content: String) {}
+    fn set_clipboard_content(&mut self, content: String) {
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        {
+            if let Ok(mut cb) = arboard::Clipboard::new() {
+                let _ = cb.set_text(content.clone());
+            }
+        }
+        if let Ok(mut s) = self.clip.lock() {
+            *s = content;
+        }
+    }
     fn set_fullscreen(&mut self, _is_full: bool) -> Result<(), FullscreenError> {
         Ok(())
     }

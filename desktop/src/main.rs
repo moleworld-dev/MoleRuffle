@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ruffle_core::backend::navigator::{OwnedFuture, SocketMode};
-use ruffle_core::events::{MouseButton as RuffleButton, MouseWheelDelta};
+use ruffle_core::events::{ImeEvent, MouseButton as RuffleButton, MouseWheelDelta};
 use ruffle_core::{FloatDuration, Player, PlayerBuilder, PlayerEvent};
 use ruffle_frontend_utils::backends::audio::CpalAudioBackend;
 use ruffle_frontend_utils::backends::navigator::{ExternalNavigatorBackend, FutureSpawner};
@@ -25,11 +25,13 @@ use ruffle_render_wgpu::backend::WgpuRenderBackend;
 
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, Modifiers, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
 use moleruffle_core as mole;
+
+mod keymap;
 
 /// winit 自定义事件:把 Ruffle 的异步任务调度回事件循环线程执行。
 enum UserEvent {
@@ -66,8 +68,11 @@ struct App {
     window: Option<Arc<Window>>,
     player: Option<Arc<Mutex<Player>>>,
     mouse_pos: PhysicalPosition<f64>,
+    modifiers: Modifiers,
     last_tick: Instant,
     frames: u64,
+    /// 上次同步给引擎的绘制尺寸(物理像素),用于检测 iOS 布局/旋转后的尺寸变化。
+    viewport: (u32, u32),
 }
 
 /// 进入 tokio 运行时上下文(reqwest / socket 异步依赖它)。
@@ -87,8 +92,10 @@ impl App {
             window: None,
             player: None,
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
+            modifiers: Modifiers::default(),
             last_tick: Instant::now(),
             frames: 0,
+            viewport: (0, 0),
         })
     }
 
@@ -169,6 +176,10 @@ impl ApplicationHandler<UserEvent> for App {
             .with_title(mole::WINDOW_TITLE)
             .with_inner_size(LogicalSize::new(mole::STAGE_WIDTH, mole::STAGE_HEIGHT));
         let window = Arc::new(el.create_window(attrs).expect("创建窗口失败"));
+        // 桌面允许输入法(中文聊天/登录)。iOS/Android 上 set_ime_allowed 会立刻弹软键盘,
+        // 移动端应在文本框聚焦时再弹(后续接 open_virtual_keyboard),这里先不无故弹出。
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        window.set_ime_allowed(true);
         let sz = window.inner_size();
         tracing::info!(
             "resumed: 窗口 {}x{} scale={}",
@@ -223,6 +234,24 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // 每帧同步真实绘制尺寸:iOS 上 resumed 时拿到的尺寸可能是布局未稳的过渡值,
+                // 且旋转/布局变化不一定发干净的 Resized,这里轮询纠正,避免 UI 溢出/缩放错。
+                if let Some(w) = &self.window {
+                    let size = w.inner_size();
+                    let scale = w.scale_factor();
+                    if (size.width, size.height) != self.viewport && size.width > 0 && size.height > 0
+                    {
+                        self.viewport = (size.width, size.height);
+                        tracing::info!("viewport 同步 {}x{} scale={}", size.width, size.height, scale);
+                        self.with_player(|p| {
+                            p.set_viewport_dimensions(ViewportDimensions {
+                                width: size.width,
+                                height: size.height,
+                                scale_factor: scale,
+                            })
+                        });
+                    }
+                }
                 let now = Instant::now();
                 let dt_ms = now.duration_since(self.last_tick).as_secs_f64() * 1000.0;
                 self.last_tick = now;
@@ -275,6 +304,42 @@ impl ApplicationHandler<UserEvent> for App {
                     p.handle_event(PlayerEvent::MouseWheel {
                         delta: MouseWheelDelta::Lines(lines),
                     })
+                });
+            }
+            WindowEvent::ModifiersChanged(new) => {
+                self.modifiers = new;
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                let key = keymap::winit_input_to_ruffle_key_descriptor(&event);
+                let modifiers = self.modifiers;
+                self.with_player(|p| match event.state {
+                    ElementState::Pressed => {
+                        p.handle_event(PlayerEvent::KeyDown { key });
+                        if let Some(code) = keymap::winit_to_ruffle_text_control(&event, modifiers) {
+                            // 复制/粘贴/剪切/全选/回车/光标移动等
+                            p.handle_event(PlayerEvent::TextControl { code });
+                        } else if let Some(text) = &event.text {
+                            // 普通字符输入(英文/数字/符号)
+                            for codepoint in text.chars() {
+                                p.handle_event(PlayerEvent::TextInput { codepoint });
+                            }
+                        }
+                    }
+                    ElementState::Released => {
+                        p.handle_event(PlayerEvent::KeyUp { key });
+                    }
+                });
+            }
+            WindowEvent::Ime(ime) => {
+                // 输入法(中文等):预编辑 + 提交
+                self.with_player(|p| match ime {
+                    Ime::Preedit(text, cursor) => {
+                        p.handle_event(PlayerEvent::Ime(ImeEvent::Preedit(text, cursor)));
+                    }
+                    Ime::Commit(text) => {
+                        p.handle_event(PlayerEvent::Ime(ImeEvent::Commit(text)));
+                    }
+                    Ime::Enabled | Ime::Disabled => {}
                 });
             }
             _ => {}

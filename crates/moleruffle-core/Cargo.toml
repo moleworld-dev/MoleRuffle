@@ -14,3 +14,7 @@ tracing.workspace = true
 # 设备字体:用系统字体库(mac=PingFang / win=YaHei / iOS=PingFang / Android=Noto CJK)
 fontdb = "0.23"
 unic-langid = "0.9"
+
+# 系统剪贴板(复制粘贴)。iOS/Android 不支持 arboard,移动端用内置字符串兜底。
+[target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
+arboard = "3"
