@@ -28,6 +28,7 @@ use url::Url;
 
 pub mod cache;
 pub use cache::{cache_dir, CachingNavigator};
+pub mod mem;
 
 /// 摩尔庄园网页版的引导 SWF(外壳 / 加载器,AS3+Flex4)。
 /// 相对路径(version/、resource/、config/、dll/)都相对它来解析。

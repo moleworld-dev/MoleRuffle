@@ -30,6 +30,9 @@ targets:
         COPY_PHASE_STRIP: NO
         SUPPORTS_MACCATALYST: NO
         ENABLE_USER_SCRIPT_SANDBOXING: NO
+        # 提升内存上限的 entitlement(把 jetsam per-process 墙从 ~3.4GB 抬到 ~9GB)。
+        # xcodebuild 会把它合进 moleruffle.app.xcent,后续强制重签名也带上。
+        CODE_SIGN_ENTITLEMENTS: MoleRuffle.entitlements
     postCompileScripts:
       - name: "注入 Rust 二进制"
         basedOnDependencyAnalysis: false

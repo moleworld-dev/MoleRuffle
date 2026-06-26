@@ -37,4 +37,6 @@ objc2-ui-kit = { version = "0.2.2", features = [
     "UIView", "UILabel", "UIColor", "UIFont", "NSText",
     "UIControl", "UIResponder", "UIPasteboard",
     "UIPasteControl", "UIPasteConfiguration", "UIPasteConfigurationSupporting",
+    # Debug HUD:UIEdgeInsets/safeAreaInsets 需 UIGeometry;monospaced 字体/字重需 UIFontDescriptor。
+    "UIGeometry", "UIFontDescriptor",
 ] }
