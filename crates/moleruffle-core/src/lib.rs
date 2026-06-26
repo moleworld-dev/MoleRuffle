@@ -20,6 +20,7 @@ use ruffle_core::backend::ui::{
 use ruffle_core::config::Letterbox;
 use ruffle_core::font::{DefaultFont, FontFileData, FontQuery};
 use ruffle_core::{LoadBehavior, Player, PlayerBuilder, StageScaleMode};
+use ruffle_render::quality::StageQuality;
 use ruffle_frontend_utils::backends::navigator::NavigatorInterface;
 use unic_langid::LanguageIdentifier;
 use url::Url;
@@ -60,6 +61,10 @@ pub fn apply_mole_settings(builder: PlayerBuilder) -> PlayerBuilder {
     builder
         .with_autoplay(true)
         .with_letterbox(Letterbox::On)
+        // ★ 画质拉满:8x MSAA(矢量边缘抗锯齿)。默认是 High=4x;High8x8=8x,GPU 不支持时
+        //   wgpu 后端会自动回落(supported_sample_count 减半),不会崩。位图(游戏美术)清晰度
+        //   靠 smoothing(默认开,双线性)+ 渲染分辨率(壳层已传屏幕原生物理像素=显示上限)。
+        .with_quality(StageQuality::High8x8)
         // ★ 强制 ShowAll:摩尔庄园舞台固定 960x560 且用 NoScale(老 Flash 游戏惯例),
         //   在手机/缩放窗口上会溢出屏幕。强制 ShowAll(force=true)把整个舞台等比缩放
         //   letterbox 适配任意屏幕尺寸,无视 SWF 自设的 scaleMode。
@@ -169,6 +174,9 @@ pub struct MoleUiBackend {
     fonts: Arc<fontdb::Database>,
     /// 应用内剪贴板兜底(移动端无系统剪贴板时用;桌面也作镜像)。
     clip: Arc<std::sync::Mutex<String>>,
+    /// 是否需要弹出软键盘:Flash 文本框聚焦时引擎调 open_virtual_keyboard 置 true,
+    /// 失焦置 false。平台壳轮询此标志去 set_ime_allowed(显示/隐藏 iOS 软键盘)。
+    kbd: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl MoleUiBackend {
@@ -193,7 +201,13 @@ impl MoleUiBackend {
         Self {
             fonts: Arc::new(db),
             clip: Arc::new(std::sync::Mutex::new(String::new())),
+            kbd: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
+    }
+
+    /// 平台壳取这个标志:为 true 时该弹软键盘(set_ime_allowed(true)),false 时收起。
+    pub fn keyboard_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.kbd.clone()
     }
 
     fn try_register(
@@ -257,13 +271,25 @@ impl UiBackend for MoleUiBackend {
     fn set_mouse_visible(&mut self, _visible: bool) {}
     fn set_mouse_cursor(&mut self, _cursor: MouseCursor) {}
     fn clipboard_content(&mut self) -> String {
-        // 桌面:读系统剪贴板;失败或移动端:用应用内兜底
+        // 桌面:读系统剪贴板(arboard);iOS:读系统剪贴板(UIPasteboard);
+        // 都失败/Android:用应用内兜底。
         #[cfg(not(any(target_os = "ios", target_os = "android")))]
         {
             if let Ok(mut cb) = arboard::Clipboard::new() {
                 if let Ok(text) = cb.get_text() {
                     return text;
                 }
+            }
+        }
+        #[cfg(target_os = "ios")]
+        {
+            // 1) UIPasteControl 授权后投递的内容优先(绕过 iOS16+ 隐私拦截)
+            if let Some(text) = paste_bridge::peek() {
+                return text;
+            }
+            // 2) 同 app 内复制的内容(.string 不受隐私限制)
+            if let Some(text) = ios_clipboard::get() {
+                return text;
             }
         }
         self.clip.lock().map(|s| s.clone()).unwrap_or_default()
@@ -275,6 +301,11 @@ impl UiBackend for MoleUiBackend {
                 let _ = cb.set_text(content.clone());
             }
         }
+        #[cfg(target_os = "ios")]
+        {
+            ios_clipboard::set(&content);
+        }
+        // 应用内镜像兜底(系统剪贴板不可用时仍能应用内复制粘贴)
         if let Ok(mut s) = self.clip.lock() {
             *s = content;
         }
@@ -292,8 +323,13 @@ impl UiBackend for MoleUiBackend {
     ) -> Vec<FontQuery> {
         Vec::new()
     }
-    fn open_virtual_keyboard(&self) {}
-    fn close_virtual_keyboard(&self) {}
+    fn open_virtual_keyboard(&self) {
+        // Flash 文本框聚焦:请求弹软键盘(平台壳轮询 keyboard_flag 去 set_ime_allowed)
+        self.kbd.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    fn close_virtual_keyboard(&self) {
+        self.kbd.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     fn language(&self) -> LanguageIdentifier {
         "zh-CN".parse().expect("合法 language id")
     }
@@ -313,5 +349,73 @@ impl UiBackend for MoleUiBackend {
         _domain: String,
     ) -> Option<DialogResultFuture> {
         None
+    }
+}
+
+/// iOS 粘贴桥:UIPasteControl(系统授权的粘贴按钮)点击后,平台壳把读到的文本经此送进来,
+/// `clipboard_content` 优先返回它,从而绕过 iOS16+ 对程序化读剪贴板的隐私拦截(不弹窗)。
+#[cfg(target_os = "ios")]
+pub mod paste_bridge {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    static BUF: Mutex<Option<String>> = Mutex::new(None);
+    static PENDING: AtomicBool = AtomicBool::new(false);
+
+    /// UIPasteControl 授权后投递的文本(置缓冲 + 置“待粘贴”标志)。
+    pub fn deliver(text: String) {
+        if let Ok(mut b) = BUF.lock() {
+            *b = Some(text);
+        }
+        PENDING.store(true, Ordering::Relaxed);
+    }
+
+    /// 平台壳轮询:为 true 时该发一次 TextControl::Paste(消费标志)。
+    pub fn take_pending() -> bool {
+        PENDING.swap(false, Ordering::Relaxed)
+    }
+
+    /// clipboard_content 偷看缓冲(不消费;粘贴的 gate 与实际插入会各读一次)。
+    pub fn peek() -> Option<String> {
+        BUF.lock().ok().and_then(|b| b.clone())
+    }
+
+    /// 文本框失焦时清掉,避免下次同 app 粘贴拿到陈旧内容。
+    pub fn clear() {
+        if let Ok(mut b) = BUF.lock() {
+            *b = None;
+        }
+        PENDING.store(false, Ordering::Relaxed);
+    }
+}
+
+/// iOS 系统剪贴板(UIPasteboard)。让游戏内的复制/粘贴与 iOS 系统剪贴板互通——
+/// 比如登录时可粘贴从密码管理器复制的账号密码。
+///
+/// 调用发生在 winit 主线程的 player tick 内(单线程事件循环),满足 UIKit 主线程要求。
+/// 读剪贴板会触发 iOS 的「X 从 Y 粘贴」提示横幅,属系统正常行为。
+#[cfg(target_os = "ios")]
+mod ios_clipboard {
+    use objc2_foundation::NSString;
+    use objc2_ui_kit::UIPasteboard;
+
+    pub fn get() -> Option<String> {
+        // SAFETY: 主线程调用;generalPasteboard/string 是标准只读 API。
+        // 注意:iOS 16+ 对“外部 app 设置的内容”做隐私保护——程序化读 .string 会被系统拦截
+        //   返回 nil(hasStrings 仍为 true),需走系统授权(真机会弹“允许粘贴”;模拟器静默拒绝)。
+        //   同 app 内复制的内容不受此限。读不到时上层会回退到应用内镜像 self.clip。
+        unsafe {
+            let pb = UIPasteboard::generalPasteboard();
+            pb.string().map(|s| s.to_string())
+        }
+    }
+
+    pub fn set(text: &str) {
+        // SAFETY: 主线程调用;setString 接受可空 NSString。
+        unsafe {
+            let pb = UIPasteboard::generalPasteboard();
+            let ns = NSString::from_str(text);
+            pb.setString(Some(&ns));
+        }
     }
 }

@@ -16,6 +16,7 @@ targets:
     platform: iOS
     sources:
       - path: Stub
+      - path: LaunchScreen.storyboard
     settings:
       base:
         PRODUCT_NAME: moleruffle
@@ -32,6 +33,6 @@ targets:
         basedOnDependencyAnalysis: false
         script: |
           set -euo pipefail
-          BIN="$SRCROOT/../target/aarch64-apple-ios/debug/moleruffle"
+          BIN="$SRCROOT/../target/aarch64-apple-ios/release/moleruffle"
           echo "注入 $BIN -> $TARGET_BUILD_DIR/$EXECUTABLE_PATH"
           cp "$BIN" "$TARGET_BUILD_DIR/$EXECUTABLE_PATH"
