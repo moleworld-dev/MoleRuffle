@@ -127,7 +127,9 @@ impl App {
 
         let mut builder = PlayerBuilder::new()
             .with_renderer(renderer)
-            .with_navigator(navigator);
+            .with_navigator(navigator)
+            // 设备字体后端:用系统字体 + 中文回退,解决动态文本缺字问题
+            .with_ui(mole::MoleUiBackend::with_system_fonts());
         match CpalAudioBackend::new(None) {
             Ok(audio) => builder = builder.with_audio(audio),
             Err(e) => tracing::warn!("无音频后端: {e}"),

@@ -11,11 +11,17 @@
 
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
+use ruffle_core::backend::ui::{
+    DialogResultFuture, FileFilter, FontDefinition, FullscreenError, MouseCursor,
+    MultiDialogResultFuture, UiBackend,
+};
 use ruffle_core::config::Letterbox;
-use ruffle_core::font::DefaultFont;
+use ruffle_core::font::{DefaultFont, FontFileData, FontQuery};
 use ruffle_core::{LoadBehavior, Player, PlayerBuilder};
 use ruffle_frontend_utils::backends::navigator::NavigatorInterface;
+use unic_langid::LanguageIdentifier;
 use url::Url;
 
 /// 摩尔庄园网页版的引导 SWF(外壳 / 加载器,AS3+Flex4)。
@@ -132,5 +138,141 @@ impl NavigatorInterface for MoleNavigatorInterface {
     ) -> impl std::future::Future<Output = bool> + Send {
         tracing::info!("放行 socket: {host}:{port}");
         async move { true }
+    }
+}
+
+/// 设备字体回退顺序:任何字体名都先试精确匹配,失败再依次退到这些
+/// “一定带中文”的字体,保证摩尔庄园的动态文本(玩家名/聊天/系统提示)能显示中文。
+const FONT_FALLBACKS: &[&str] = &[
+    "PingFang SC",       // macOS / iOS
+    "Microsoft YaHei",   // Windows
+    "Noto Sans CJK SC",  // Linux / Android
+    "Source Han Sans SC",
+    "Heiti SC",
+    "STHeiti",
+    "Arial Unicode MS",
+    "Hiragino Sans GB",
+];
+
+/// MoleRuffle 的 `UiBackend`。
+///
+/// 默认的 `NullUiBackend` 不提供任何设备字体,导致摩尔庄园所有动态文本
+/// (`_sans`/`_serif`)“text will be missing”。这里用系统字体库(fontdb)
+/// 实现 `load_device_font`:游戏要什么字体名就给什么,找不到就回退到带中文的字体。
+/// 其余方法全部 no-op(本客户端不需要剪贴板/对话框等)。
+#[derive(Clone)]
+pub struct MoleUiBackend {
+    fonts: Arc<fontdb::Database>,
+}
+
+impl MoleUiBackend {
+    /// 加载系统字体(mac=PingFang / win=YaHei / iOS=PingFang / Android=Noto CJK)。
+    pub fn with_system_fonts() -> Self {
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        tracing::info!("MoleUiBackend: 载入 {} 个系统字体面", db.len());
+        Self {
+            fonts: Arc::new(db),
+        }
+    }
+
+    fn try_register(
+        &self,
+        family: &str,
+        query: &FontQuery,
+        register: &mut dyn FnMut(FontDefinition),
+    ) -> bool {
+        let q = fontdb::Query {
+            families: &[fontdb::Family::Name(family)],
+            weight: if query.is_bold {
+                fontdb::Weight::BOLD
+            } else {
+                fontdb::Weight::NORMAL
+            },
+            style: if query.is_italic {
+                fontdb::Style::Italic
+            } else {
+                fontdb::Style::Normal
+            },
+            ..Default::default()
+        };
+        let Some(id) = self.fonts.query(&q) else {
+            return false;
+        };
+        let def = self.fonts.with_face_data(id, |data, index| FontDefinition::FontFile {
+            name: query.name.clone(),
+            is_bold: query.is_bold,
+            is_italic: query.is_italic,
+            data: FontFileData::new(data.to_vec()),
+            index,
+        });
+        if let Some(def) = def {
+            register(def);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl UiBackend for MoleUiBackend {
+    fn load_device_font(&self, query: &FontQuery, register: &mut dyn FnMut(FontDefinition)) {
+        // 1) 先按游戏请求的确切字体名找
+        if self.try_register(&query.name, query, register) {
+            return;
+        }
+        // 2) 退到带中文的字体,保证中文不丢
+        for fallback in FONT_FALLBACKS {
+            if self.try_register(fallback, query, register) {
+                tracing::debug!("字体 '{}' 回退到 '{}'", query.name, fallback);
+                return;
+            }
+        }
+        tracing::warn!("字体 '{}' 无可用回退", query.name);
+    }
+
+    fn mouse_visible(&self) -> bool {
+        true
+    }
+    fn set_mouse_visible(&mut self, _visible: bool) {}
+    fn set_mouse_cursor(&mut self, _cursor: MouseCursor) {}
+    fn clipboard_content(&mut self) -> String {
+        String::new()
+    }
+    fn set_clipboard_content(&mut self, _content: String) {}
+    fn set_fullscreen(&mut self, _is_full: bool) -> Result<(), FullscreenError> {
+        Ok(())
+    }
+    fn display_root_movie_download_failed_message(&self, _invalid_swf: bool, _fetch_error: String) {}
+    fn message(&self, _message: &str) {}
+    fn display_unsupported_video(&self, _url: Url) {}
+    fn sort_device_fonts(
+        &self,
+        _query: &FontQuery,
+        _register: &mut dyn FnMut(FontDefinition),
+    ) -> Vec<FontQuery> {
+        Vec::new()
+    }
+    fn open_virtual_keyboard(&self) {}
+    fn close_virtual_keyboard(&self) {}
+    fn language(&self) -> LanguageIdentifier {
+        "zh-CN".parse().expect("合法 language id")
+    }
+    fn display_file_open_dialog(&mut self, _filters: Vec<FileFilter>) -> Option<DialogResultFuture> {
+        None
+    }
+    fn display_file_open_dialog_multiple(
+        &mut self,
+        _filters: Vec<FileFilter>,
+    ) -> Option<MultiDialogResultFuture> {
+        None
+    }
+    fn close_file_dialog(&mut self) {}
+    fn display_file_save_dialog(
+        &mut self,
+        _file_name: String,
+        _domain: String,
+    ) -> Option<DialogResultFuture> {
+        None
     }
 }
