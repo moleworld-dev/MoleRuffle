@@ -26,6 +26,9 @@ use ruffle_frontend_utils::backends::storage::DiskStorageBackend;
 use unic_langid::LanguageIdentifier;
 use url::Url;
 
+pub mod cache;
+pub use cache::{cache_dir, CachingNavigator};
+
 /// 摩尔庄园网页版的引导 SWF(外壳 / 加载器,AS3+Flex4)。
 /// 相对路径(version/、resource/、config/、dll/)都相对它来解析。
 pub const GAME_SWF_URL: &str = "http://mole.61.com/Client.swf";
@@ -211,9 +214,11 @@ const FONT_FALLBACKS: &[&str] = &[
     "Hiragino Sans GB",
 ];
 
-/// 打包进二进制的中文+拉丁兜底字体(STHeiti 子集:ASCII+标点+全部常用汉字+假名,~11MB)。
-/// iOS 真机沙盒读不到系统中文字体、fontdb 按名查全失败时用它,保证动态文本不缺字。
-/// `include_bytes!` 把字节编进 .rodata;`FontFileData::new(BUNDLED_FONT)` 对 &'static 切片零拷贝。
+/// 打包进二进制的中文+拉丁兜底字体:**PingFang SC Regular(苹方,iOS 原生高清字体)** 子集
+/// (ASCII+标点+全部常用汉字 U+4E00-9FFF+假名,CFF 轮廓,~8.5MB)。iOS 真机沙盒读不到系统
+/// 中文字体(/System/Library/Fonts/Core 不可读)、fontdb 按名查 PingFang 全失败时用它兜底,
+/// 保证动态文本(玩家名/聊天/输入)不缺字且是 iOS 原生观感。ttf_parser 0.25 的 outline_glyph
+/// 支持 CFF;`include_bytes!` 编进 .rodata,`FontFileData::new(BUNDLED_FONT)` 对 &'static 零拷贝。
 const BUNDLED_FONT: &[u8] = include_bytes!("../assets/molefont.ttf");
 
 /// MoleRuffle 的 `UiBackend`。

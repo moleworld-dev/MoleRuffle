@@ -23,6 +23,15 @@ xcodebuild -project ios/MoleRuffle.xcodeproj -scheme MoleRuffle \
 
 APP="$DD/Build/Products/Debug-iphoneos/moleruffle.app"
 
+# 强制重签名:postCompile 注入 Rust 二进制后,增量构建时 xcodebuild 可能跳过 codesign
+# (stub 没变,以为已签),导致最终可执行体是未签名的注入二进制 → 装机报 "No code signature found"。
+# 这里无条件用开发证书重签一次,稳妥。
+echo "== 3.5 强制重签名(注入后)=="
+IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null | grep "Apple Development" | head -1 | awk '{print $2}')
+XCENT=$(find "$DD" -name "moleruffle.app.xcent" 2>/dev/null | head -1)
+codesign --force --sign "$IDENTITY" ${XCENT:+--entitlements "$XCENT"} --generate-entitlement-der "$APP"
+codesign --verify --verbose "$APP" || { echo "签名校验失败"; exit 1; }
+
 echo "== 4. 安装到真机 =="
 xcrun devicectl device install app --device "$DEV" "$APP"
 

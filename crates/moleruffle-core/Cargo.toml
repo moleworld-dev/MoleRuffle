@@ -17,6 +17,10 @@ dirs.workspace = true
 # 设备字体:用系统字体库(mac=PingFang / win=YaHei / iOS=PingFang / Android=Noto CJK)
 fontdb = "0.23"
 unic-langid = "0.9"
+# 本地资源缓存(CachingNavigator 包装层)需要的、与 ruffle 对齐的类型/版本
+encoding_rs = "0.8"
+indexmap = "2"
+async-channel = "2"
 
 # 系统剪贴板(复制粘贴)。桌面用 arboard。
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
