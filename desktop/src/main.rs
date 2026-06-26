@@ -67,6 +67,7 @@ struct App {
     player: Option<Arc<Mutex<Player>>>,
     mouse_pos: PhysicalPosition<f64>,
     last_tick: Instant,
+    frames: u64,
 }
 
 /// 进入 tokio 运行时上下文(reqwest / socket 异步依赖它)。
@@ -87,6 +88,7 @@ impl App {
             player: None,
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
             last_tick: Instant::now(),
+            frames: 0,
         })
     }
 
@@ -167,10 +169,20 @@ impl ApplicationHandler<UserEvent> for App {
             .with_title(mole::WINDOW_TITLE)
             .with_inner_size(LogicalSize::new(mole::STAGE_WIDTH, mole::STAGE_HEIGHT));
         let window = Arc::new(el.create_window(attrs).expect("创建窗口失败"));
+        let sz = window.inner_size();
+        tracing::info!(
+            "resumed: 窗口 {}x{} scale={}",
+            sz.width,
+            sz.height,
+            window.scale_factor()
+        );
         let player = self.build_player(window.clone());
+        window.request_redraw();
         self.window = Some(window);
         self.player = Some(player);
         self.last_tick = Instant::now();
+        // Poll:让 about_to_wait 持续触发去 request_redraw,
+        // 渲染只在 RedrawRequested 里做(iOS 要求渲染在 RedrawRequested 阶段)。
         el.set_control_flow(ControlFlow::Poll);
     }
 
@@ -180,6 +192,12 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::TaskPoll(runnable) => {
                 runnable.run();
             }
+        }
+        // 异步任务(如 SWF 加载完成)后引导/维持 redraw 循环。
+        // iOS 上 resumed 里的首次 request_redraw 可能在窗口就绪前丢失,
+        // 这里在 SWF/资源加载事件后再请求,确保渲染循环被启动。
+        if let Some(w) = &self.window {
+            w.request_redraw();
         }
     }
 
@@ -205,7 +223,17 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.with_player(|p| p.render());
+                let now = Instant::now();
+                let dt_ms = now.duration_since(self.last_tick).as_secs_f64() * 1000.0;
+                self.last_tick = now;
+                self.with_player(|p| {
+                    p.tick(FloatDuration::from_millis(dt_ms));
+                    p.render();
+                });
+                self.frames += 1;
+                if self.frames % 60 == 1 {
+                    tracing::info!("render frame #{}", self.frames);
+                }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 self.mouse_pos = position;
@@ -253,23 +281,11 @@ impl ApplicationHandler<UserEvent> for App {
         }
     }
 
+    // Poll 下持续触发:推进 tokio 异步 + 请求下一帧(渲染在 RedrawRequested 做)
     fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
         enter_runtime!(self);
-        let now = Instant::now();
-        let dt_ms = now.duration_since(self.last_tick).as_secs_f64() * 1000.0;
-        self.last_tick = now;
-
-        let needs_redraw = self
-            .with_player(|p| {
-                p.tick(FloatDuration::from_millis(dt_ms));
-                p.needs_render()
-            })
-            .unwrap_or(false);
-
-        if needs_redraw {
-            if let Some(w) = &self.window {
-                w.request_redraw();
-            }
+        if let Some(w) = &self.window {
+            w.request_redraw();
         }
     }
 }

@@ -170,7 +170,20 @@ impl MoleUiBackend {
     pub fn with_system_fonts() -> Self {
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
-        tracing::info!("MoleUiBackend: 载入 {} 个系统字体面", db.len());
+        // iOS/Android 上 `load_system_fonts` 常找不到系统字体目录(返回 0),
+        // 这里显式补上各平台的系统字体路径,确保有中文字体可回退。
+        for dir in [
+            "/System/Library/Fonts",              // iOS / macOS
+            "/System/Library/Fonts/Core",         // iOS 核心字体(含 PingFang)
+            "/System/Library/Fonts/Cache",        // iOS
+            "/System/Library/Fonts/Supplemental", // macOS(Arial Unicode 等)
+            "/system/fonts",                      // Android(Noto CJK)
+            "/system/font",
+            "/data/fonts",
+        ] {
+            db.load_fonts_dir(dir);
+        }
+        tracing::info!("MoleUiBackend: 载入 {} 个字体面", db.len());
         Self {
             fonts: Arc::new(db),
         }
