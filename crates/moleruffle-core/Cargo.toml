@@ -1,0 +1,13 @@
+[package]
+name = "moleruffle-core"
+description = "MoleRuffle 跨平台共享核心:摩尔庄园专属配置、Player 装配、域名守卫 spoof、socket 放行、中文字体回退"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+ruffle_core.workspace = true
+ruffle_frontend_utils.workspace = true
+url.workspace = true
+tracing.workspace = true

@@ -1,0 +1,16 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.DS_Store
+
+# 平台壳产物
+/android/.gradle
+/android/app/build
+/android/local.properties
+/ios/build
+*.xcuserstate
+DerivedData/
+
+# 日志/临时
+*.log
+/scratch
