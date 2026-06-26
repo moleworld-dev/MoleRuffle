@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -24,14 +25,22 @@ use ruffle_render::backend::ViewportDimensions;
 use ruffle_render_wgpu::backend::WgpuRenderBackend;
 
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition};
-use winit::event::{ElementState, Ime, Modifiers, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::dpi::PhysicalPosition;
+// LogicalSize 只在桌面用(iOS 不设 inner_size,见 resumed)
+#[cfg(not(target_os = "ios"))]
+use winit::dpi::LogicalSize;
+use winit::event::{
+    ElementState, Ime, Modifiers, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::{Window, WindowId};
 
 use moleruffle_core as mole;
 
 mod keymap;
+/// iOS 纯触摸复制/粘贴工具条(原生 UIView 叠层)。
+#[cfg(target_os = "ios")]
+mod ios_textbar;
 
 /// winit 自定义事件:把 Ruffle 的异步任务调度回事件循环线程执行。
 enum UserEvent {
@@ -73,6 +82,12 @@ struct App {
     frames: u64,
     /// 上次同步给引擎的绘制尺寸(物理像素),用于检测 iOS 布局/旋转后的尺寸变化。
     viewport: (u32, u32),
+    /// 软键盘请求标志(来自 MoleUiBackend)+ 当前是否已开启,用于按需 set_ime_allowed。
+    kbd: Option<Arc<AtomicBool>>,
+    kbd_on: bool,
+    /// iOS 纯触摸复制/粘贴工具条(文本框聚焦时显示)。
+    #[cfg(target_os = "ios")]
+    textbar: Option<ios_textbar::TextBar>,
 }
 
 /// 进入 tokio 运行时上下文(reqwest / socket 异步依赖它)。
@@ -80,6 +95,20 @@ macro_rules! enter_runtime {
     ($self:ident) => {
         let _guard = $self.runtime.enter();
     };
+}
+
+/// 渲染表面 / 视口尺寸(物理像素)。
+///
+/// iOS 用 `outer_size`(整个全屏 view),**不要**用 `inner_size`(安全区,内缩且偏小):
+/// winit iOS 的 `Touch.location` 是相对全屏 window 的坐标、CAMetalLayer 也是全屏;
+/// 若拿安全区尺寸当 viewport,渲染会被拉伸,且触摸坐标空间(全屏)≠ viewport(安全区)
+/// → 触摸偏移(越靠边偏越多)。桌面用 `inner_size`(客户区,排除标题栏)。
+fn surface_dims(window: &Window) -> (u32, u32) {
+    #[cfg(target_os = "ios")]
+    let s = window.outer_size();
+    #[cfg(not(target_os = "ios"))]
+    let s = window.inner_size();
+    (s.width.max(1), s.height.max(1))
 }
 
 impl App {
@@ -96,13 +125,15 @@ impl App {
             last_tick: Instant::now(),
             frames: 0,
             viewport: (0, 0),
+            kbd: None,
+            kbd_on: false,
+            #[cfg(target_os = "ios")]
+            textbar: None,
         })
     }
 
-    fn build_player(&self, window: Arc<Window>) -> Arc<Mutex<Player>> {
-        let size = window.inner_size();
-        let width = size.width.max(1);
-        let height = size.height.max(1);
+    fn build_player(&self, window: Arc<Window>) -> (Arc<Mutex<Player>>, Arc<AtomicBool>) {
+        let (width, height) = surface_dims(&window);
 
         let renderer = unsafe {
             WgpuRenderBackend::for_window_unsafe(
@@ -134,11 +165,13 @@ impl App {
             mole::MoleNavigatorInterface,
         );
 
+        // 设备字体后端:系统字体 + 中文回退;并取软键盘标志(文本框聚焦时弹键盘)
+        let ui = mole::MoleUiBackend::with_system_fonts();
+        let kbd = ui.keyboard_flag();
         let mut builder = PlayerBuilder::new()
             .with_renderer(renderer)
             .with_navigator(navigator)
-            // 设备字体后端:用系统字体 + 中文回退,解决动态文本缺字问题
-            .with_ui(mole::MoleUiBackend::with_system_fonts());
+            .with_ui(ui);
         match CpalAudioBackend::new(None) {
             Ok(audio) => builder = builder.with_audio(audio),
             Err(e) => tracing::warn!("无音频后端: {e}"),
@@ -156,7 +189,7 @@ impl App {
             mole::set_mole_fonts(&mut p);
             p.fetch_root_movie(mole::GAME_SWF_URL.to_string(), vec![], Box::new(|_| {}));
         }
-        player
+        (player, kbd)
     }
 
     fn with_player<R>(&self, f: impl FnOnce(&mut Player) -> R) -> Option<R> {
@@ -172,14 +205,27 @@ impl ApplicationHandler<UserEvent> for App {
             return;
         }
         enter_runtime!(self);
-        let attrs = Window::default_attributes()
-            .with_title(mole::WINDOW_TITLE)
-            .with_inner_size(LogicalSize::new(mole::STAGE_WIDTH, mole::STAGE_HEIGHT));
+        // ★ inner_size 只在桌面设。winit iOS 会把 inner_size 当成 UIView/UIWindow 的固定 frame
+        //   (winit ios window.rs:510),设成 960x560 会让 view 不铺满全屏 → winit 上报的 viewport
+        //   偏小且与真实屏幕/drawable 不一致 → Ruffle 的 ShowAll 基于错误视口计算 → 画面溢出、
+        //   左右被裁、按钮点不到(实测现象)。iOS 不设 inner_size,让 winit 用全屏 screen_bounds。
+        let attrs = Window::default_attributes().with_title(mole::WINDOW_TITLE);
+        #[cfg(not(target_os = "ios"))]
+        let attrs = attrs.with_inner_size(LogicalSize::new(mole::STAGE_WIDTH, mole::STAGE_HEIGHT));
+        // ★ iOS 强制横屏:摩尔庄园是 960x560 横屏游戏,但 winit 默认 valid_orientations =
+        //   LandscapeAndPortrait,会让 view controller 的 supportedInterfaceOrientations 允许竖屏,
+        //   于是 app 停在竖屏、横屏内容被旋转 90° 塞进竖屏窗口。设成 Landscape 让它只报横屏,
+        //   iOS 启动即旋转到横屏;顺带隐藏 home indicator 做全屏。
+        #[cfg(target_os = "ios")]
+        let attrs = {
+            use winit::platform::ios::{ValidOrientations, WindowAttributesExtIOS};
+            attrs
+                .with_valid_orientations(ValidOrientations::Landscape)
+                .with_prefers_home_indicator_hidden(true)
+        };
         let window = Arc::new(el.create_window(attrs).expect("创建窗口失败"));
-        // 桌面允许输入法(中文聊天/登录)。iOS/Android 上 set_ime_allowed 会立刻弹软键盘,
-        // 移动端应在文本框聚焦时再弹(后续接 open_virtual_keyboard),这里先不无故弹出。
-        #[cfg(not(any(target_os = "ios", target_os = "android")))]
-        window.set_ime_allowed(true);
+        // 软键盘/IME 不在这里无条件开启;改由文本框聚焦时(MoleUiBackend 标志)按需 set_ime_allowed,
+        // 这样 iOS 不会一进来就弹软键盘,桌面 CJK 输入也只在需要时启用。
         let sz = window.inner_size();
         tracing::info!(
             "resumed: 窗口 {}x{} scale={}",
@@ -187,10 +233,21 @@ impl ApplicationHandler<UserEvent> for App {
             sz.height,
             window.scale_factor()
         );
-        let player = self.build_player(window.clone());
+        let (player, kbd) = self.build_player(window.clone());
         window.request_redraw();
+        // iOS:创建纯触摸复制/粘贴工具条(挂到 UIView,初始隐藏)
+        #[cfg(target_os = "ios")]
+        {
+            self.textbar = ios_textbar::TextBar::new(&window);
+            if self.textbar.is_some() {
+                tracing::info!("iOS 文本工具条已创建");
+            } else {
+                tracing::warn!("iOS 文本工具条创建失败");
+            }
+        }
         self.window = Some(window);
         self.player = Some(player);
+        self.kbd = Some(kbd);
         self.last_tick = Instant::now();
         // Poll:让 about_to_wait 持续触发去 request_redraw,
         // 渲染只在 RedrawRequested 里做(iOS 要求渲染在 RedrawRequested 阶段)。
@@ -216,37 +273,44 @@ impl ApplicationHandler<UserEvent> for App {
         enter_runtime!(self);
         match event {
             WindowEvent::CloseRequested => el.exit(),
-            WindowEvent::Resized(size) => {
-                let scale = self
-                    .window
-                    .as_ref()
-                    .map(|w| w.scale_factor())
-                    .unwrap_or(1.0);
-                self.with_player(|p| {
-                    p.set_viewport_dimensions(ViewportDimensions {
-                        width: size.width.max(1),
-                        height: size.height.max(1),
-                        scale_factor: scale,
-                    })
-                });
+            WindowEvent::Resized(_size) => {
+                // 忽略事件携带的 size(iOS 上可能是安全区/全屏不一致),统一用 surface_dims。
                 if let Some(w) = &self.window {
+                    let (width, height) = surface_dims(w);
+                    let scale = w.scale_factor();
+                    let inner = w.inner_size();
+                    self.viewport = (width, height);
+                    tracing::info!(
+                        "Resized: surface={}x{} (inner={}x{}) scale={}",
+                        width, height, inner.width, inner.height, scale
+                    );
+                    self.with_player(|p| {
+                        p.set_viewport_dimensions(ViewportDimensions {
+                            width,
+                            height,
+                            scale_factor: scale,
+                        })
+                    });
                     w.request_redraw();
                 }
             }
             WindowEvent::RedrawRequested => {
                 // 每帧同步真实绘制尺寸:iOS 上 resumed 时拿到的尺寸可能是布局未稳的过渡值,
-                // 且旋转/布局变化不一定发干净的 Resized,这里轮询纠正,避免 UI 溢出/缩放错。
+                // 且旋转/布局变化不一定发干净的 Resized,这里轮询纠正,避免 UI 溢出/缩放错/触摸偏移。
                 if let Some(w) = &self.window {
-                    let size = w.inner_size();
+                    let (width, height) = surface_dims(w);
                     let scale = w.scale_factor();
-                    if (size.width, size.height) != self.viewport && size.width > 0 && size.height > 0
-                    {
-                        self.viewport = (size.width, size.height);
-                        tracing::info!("viewport 同步 {}x{} scale={}", size.width, size.height, scale);
+                    if (width, height) != self.viewport && width > 0 && height > 0 {
+                        self.viewport = (width, height);
+                        let inner = w.inner_size();
+                        tracing::info!(
+                            "viewport 同步 surface={}x{} (inner={}x{}) scale={}",
+                            width, height, inner.width, inner.height, scale
+                        );
                         self.with_player(|p| {
                             p.set_viewport_dimensions(ViewportDimensions {
-                                width: size.width,
-                                height: size.height,
+                                width,
+                                height,
                                 scale_factor: scale,
                             })
                         });
@@ -275,6 +339,61 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::CursorLeft { .. } => {
                 self.with_player(|p| p.handle_event(PlayerEvent::MouseLeave));
+            }
+            // ★ 触摸(iOS/Android):winit 在触屏上发 Touch 而非鼠标事件,
+            //   这里把单指触摸翻译成鼠标:按下=移动到该点+按下,移动=拖动,抬起=移动到落点+松开。
+            //   没有这段,手机上点任何东西都没反应。location 是物理像素,与 ViewportDimensions 一致。
+            WindowEvent::Touch(Touch {
+                phase, location, ..
+            }) => {
+                let (x, y) = (location.x, location.y);
+                self.mouse_pos = location;
+                // iOS:先看是否点中纯触摸文本工具条(粘贴/复制/剪切/全选)。命中则发 TextControl
+                // 并吞掉该次触摸(不当作游戏点击转发);只在按下时触发一次,Moved/Ended 一并吞掉。
+                #[cfg(target_os = "ios")]
+                if let Some(tb) = &self.textbar {
+                    if let Some(action) = tb.hit_test(x, y) {
+                        if phase == TouchPhase::Started {
+                            use ios_textbar::TextAction;
+                            use ruffle_core::events::TextControlCode;
+                            let (code, name) = match action {
+                                TextAction::Copy => (TextControlCode::Copy, "复制"),
+                                TextAction::Cut => (TextControlCode::Cut, "剪切"),
+                                TextAction::SelectAll => (TextControlCode::SelectAll, "全选"),
+                            };
+                            self.with_player(|p| {
+                                p.handle_event(PlayerEvent::TextControl { code })
+                            });
+                            tracing::info!("文本工具条:{name}");
+                        }
+                        return;
+                    }
+                }
+                self.with_player(|p| match phase {
+                    TouchPhase::Started => {
+                        p.handle_event(PlayerEvent::MouseMove { x, y });
+                        p.handle_event(PlayerEvent::MouseDown {
+                            x,
+                            y,
+                            button: RuffleButton::Left,
+                            index: None,
+                        });
+                    }
+                    TouchPhase::Moved => {
+                        p.handle_event(PlayerEvent::MouseMove { x, y });
+                    }
+                    TouchPhase::Ended | TouchPhase::Cancelled => {
+                        // 先把指针对齐到抬手落点,再松开,保证点击命中正确控件
+                        p.handle_event(PlayerEvent::MouseMove { x, y });
+                        p.handle_event(PlayerEvent::MouseUp {
+                            x,
+                            y,
+                            button: RuffleButton::Left,
+                        });
+                        // 触摸抬起后没有持续光标,清掉 hover 状态(否则按钮一直高亮)
+                        p.handle_event(PlayerEvent::MouseLeave);
+                    }
+                });
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let btn = match button {
@@ -349,6 +468,43 @@ impl ApplicationHandler<UserEvent> for App {
     // Poll 下持续触发:推进 tokio 异步 + 请求下一帧(渲染在 RedrawRequested 做)
     fn about_to_wait(&mut self, _el: &ActiveEventLoop) {
         enter_runtime!(self);
+        // 软键盘 + iOS 文本工具条按需开关:Flash 文本框聚焦→标志 true→弹软键盘+显示工具条;失焦→收起。
+        if let Some(kbd) = &self.kbd {
+            let want = kbd.load(Ordering::Relaxed);
+            if want != self.kbd_on {
+                self.kbd_on = want;
+                if let Some(w) = &self.window {
+                    w.set_ime_allowed(want);
+                }
+                tracing::info!("软键盘 {}", if want { "开" } else { "关" });
+                // iOS:同步显示/隐藏纯触摸复制粘贴工具条(显示前按当前屏宽居中布局)
+                #[cfg(target_os = "ios")]
+                {
+                    if let (Some(tb), Some(w)) = (self.textbar.as_mut(), self.window.as_ref()) {
+                        if want {
+                            let scale = w.scale_factor();
+                            let (w_px, _) = surface_dims(w);
+                            tb.layout(w_px as f64 / scale, scale);
+                        }
+                        tb.set_visible(want);
+                    }
+                    // 文本框失焦时清掉粘贴桥缓冲,避免下次拿到陈旧内容
+                    if !want {
+                        mole::paste_bridge::clear();
+                    }
+                }
+            }
+        }
+        // iOS:UIPasteControl 授权投递后,这里发一次 TextControl::Paste 让 Ruffle 取 clipboard_content
+        #[cfg(target_os = "ios")]
+        if mole::paste_bridge::take_pending() {
+            self.with_player(|p| {
+                p.handle_event(PlayerEvent::TextControl {
+                    code: ruffle_core::events::TextControlCode::Paste,
+                })
+            });
+            tracing::info!("UIPasteControl→粘贴已注入");
+        }
         if let Some(w) = &self.window {
             w.request_redraw();
         }
@@ -357,7 +513,11 @@ impl ApplicationHandler<UserEvent> for App {
 
 fn main() -> anyhow::Result<()> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new("warn,ruffle=info,avm_trace=info,moleruffle=info")
+        // winit=error:iOS 上用 Poll 驱动重绘时,winit 会在 ProcessingRedraws 阶段收到 AboutToWait,
+        // 每帧刷屏式 warn("processing non RedrawRequested event ...")。这是该 winit 版本 iOS
+        // 重绘模型的固有副产物(request_redraw 只能在事件阶段调,不能在 RedrawRequested 里调),
+        // 无害但拖累帧率,这里压到 error 消除其每帧 {:#?} 格式化开销。
+        tracing_subscriber::EnvFilter::new("warn,winit=error,ruffle=info,avm_trace=info,moleruffle=info")
     });
     tracing_subscriber::fmt().with_env_filter(filter).init();
 

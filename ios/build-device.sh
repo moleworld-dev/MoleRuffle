@@ -9,8 +9,9 @@ export PATH="$HOME/.cargo/bin:$PATH"
 DEV="${1:?用法: ios/build-device.sh <设备UDID>}"
 DD=/tmp/mole_dd
 
-echo "== 1. 编译真机二进制 (aarch64-apple-ios) =="
-cargo +stable build --target aarch64-apple-ios -p moleruffle-desktop
+echo "== 1. 编译真机二进制 (aarch64-apple-ios, release) =="
+# release:AVM 解释器 debug 慢一个数量级,真机帧率/流畅度全靠 release(project.yml 注入 release 二进制)
+cargo +stable build --release --target aarch64-apple-ios -p moleruffle-desktop
 
 echo "== 2. 生成 Xcode 工程 =="
 ( cd ios && xcodegen generate )

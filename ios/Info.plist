@@ -24,8 +24,8 @@
     <true/>
     <key>MinimumOSVersion</key>
     <string>15.0</string>
-    <key>UILaunchScreen</key>
-    <dict/>
+    <key>UILaunchStoryboardName</key>
+    <string>LaunchScreen</string>
     <key>UIRequiredDeviceCapabilities</key>
     <array>
         <string>arm64</string>
@@ -38,6 +38,8 @@
         <string>UIInterfaceOrientationLandscapeLeft</string>
     </array>
     <key>UIStatusBarHidden</key>
+    <true/>
+    <key>UIRequiresFullScreen</key>
     <true/>
     <!-- 明文 HTTP 放行(给系统网络栈用;reqwest+rustls 实际不走系统栈,这里是保险) -->
     <key>NSAppTransportSecurity</key>

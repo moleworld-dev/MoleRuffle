@@ -17,8 +17,11 @@ pub fn winit_to_ruffle_text_control(
     modifiers: Modifiers,
 ) -> Option<TextControlCode> {
     let shift = modifiers.state().shift_key();
+    // 复制/粘贴等修饰键:Apple 平台(macOS 桌面 + iOS 含模拟器接 Mac 硬件键盘/真机外接键盘)
+    // 用 Cmd(super);其它平台用 Ctrl。原来只判 cfg!(macos),iOS 上 Cmd+C/V 全失效。
     let ctrl_cmd = modifiers.state().control_key()
-        || (modifiers.state().super_key() && cfg!(target_os = "macos"));
+        || (modifiers.state().super_key()
+            && cfg!(any(target_os = "macos", target_os = "ios")));
     match event.logical_key.as_ref() {
         Key::Named(NamedKey::Enter) => Some(TextControlCode::Enter),
         Key::Character("a") if ctrl_cmd => Some(TextControlCode::SelectAll),

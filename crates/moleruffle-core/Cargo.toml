@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 ruffle_core.workspace = true
+ruffle_render.workspace = true   # StageQuality(画质/MSAA 档位)
 ruffle_frontend_utils.workspace = true
 url.workspace = true
 tracing.workspace = true
@@ -15,6 +16,11 @@ tracing.workspace = true
 fontdb = "0.23"
 unic-langid = "0.9"
 
-# 系统剪贴板(复制粘贴)。iOS/Android 不支持 arboard,移动端用内置字符串兜底。
+# 系统剪贴板(复制粘贴)。桌面用 arboard。
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
 arboard = "3"
+
+# iOS 系统剪贴板用 UIPasteboard(objc2)。版本对齐 winit 已用的 objc2 0.5.2 套,不引入新版本。
+[target.'cfg(target_os = "ios")'.dependencies]
+objc2-foundation = { version = "0.2.2", features = ["NSString"] }
+objc2-ui-kit = { version = "0.2.2", features = ["UIPasteboard"] }
