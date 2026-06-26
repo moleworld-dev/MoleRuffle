@@ -1,0 +1,42 @@
+# MoleRuffle — 专为「摩尔庄园」网页版(mole.61.com)定制的跨平台原生客户端
+# 基于 Ruffle 引擎,Rust 编写。目标平台:Windows / macOS / Linux / Android / iOS。
+[workspace]
+resolver = "2"
+members = [
+    "crates/moleruffle-core",
+    "desktop",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/moleworld-dev/MoleRuffle"
+authors = ["moleworld-dev"]
+
+[workspace.dependencies]
+# ── Ruffle 引擎:钉死在一个已【实测能在线跑通 mole.61.com】的 commit ──
+# 实测:cargo build -p ruffle_desktop @304a3c9d,跑 http://mole.61.com/Client.swf
+# 成功进入游戏世界、原生 TCP 连真实服务器、收发二进制协议、9.5 分钟零崩。
+ruffle_core = { git = "https://github.com/ruffle-rs/ruffle", rev = "304a3c9dcaf42ed6d4b1c8bbd05f10d21f407c2e", features = ["audio", "mp3", "aac", "nellymoser", "default_compatibility_rules"] }
+ruffle_render = { git = "https://github.com/ruffle-rs/ruffle", rev = "304a3c9dcaf42ed6d4b1c8bbd05f10d21f407c2e" }
+ruffle_render_wgpu = { git = "https://github.com/ruffle-rs/ruffle", rev = "304a3c9dcaf42ed6d4b1c8bbd05f10d21f407c2e" }
+ruffle_frontend_utils = { git = "https://github.com/ruffle-rs/ruffle", rev = "304a3c9dcaf42ed6d4b1c8bbd05f10d21f407c2e", features = ["cpal", "navigator"] }
+
+# ── 与 Ruffle 完全对齐的版本(否则 wgpu surface 类型对不上)──
+url = "2.5.8"
+wgpu = "27.0.1"
+winit = "0.30.13"
+raw-window-handle = "0.6.2"
+futures = "0.3.32"
+async-task = "4.7.1"
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros"] }
+tracing = "0.1.43"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1.0"
+
+[profile.release]
+# 引擎是 AVM 解释器,优化等级对手机帧率影响大
+opt-level = 3
+lto = "thin"
+codegen-units = 1

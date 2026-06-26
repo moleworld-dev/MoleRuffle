@@ -1,0 +1,30 @@
+[package]
+name = "moleruffle-desktop"
+description = "MoleRuffle 桌面端(Windows/macOS/Linux)— 摩尔庄园网页版原生客户端"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "moleruffle"
+path = "src/main.rs"
+
+[dependencies]
+moleruffle-core = { path = "../crates/moleruffle-core" }
+
+ruffle_core.workspace = true
+ruffle_render.workspace = true
+ruffle_render_wgpu.workspace = true
+ruffle_frontend_utils.workspace = true
+
+url.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+raw-window-handle.workspace = true
+futures.workspace = true
+async-task.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
