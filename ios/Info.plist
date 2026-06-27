@@ -20,6 +20,9 @@
     <string>0.1.0</string>
     <key>CFBundleVersion</key>
     <string>1</string>
+    <!-- 出口合规:仅用标准 HTTPS/系统加密(豁免),声明无非豁免加密,免每次构建在 ASC 答加密问题。 -->
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
     <key>LSRequiresIPhoneOS</key>
     <true/>
     <key>MinimumOSVersion</key>
