@@ -278,3 +278,40 @@ fn map_key_location(event: &KeyEvent) -> KeyLocation {
         WinitKeyLocation::Numpad => KeyLocation::Numpad,
     }
 }
+
+/// 屏幕虚拟手柄的按键(方向键 + 空格)。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GamepadKey {
+    Up,
+    Down,
+    Left,
+    Right,
+    Space,
+}
+
+/// 把虚拟手柄按键合成成 Ruffle 的 KeyDescriptor(physical+logical+location 与真实键盘一致;
+/// 摩尔庄园靠方向键走路、空格交互)。
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+pub fn gamepad_key_descriptor(k: GamepadKey) -> KeyDescriptor {
+    let (physical_key, logical_key) = match k {
+        GamepadKey::Up => (PhysicalKey::ArrowUp, LogicalKey::Named(RuffleNamedKey::ArrowUp)),
+        GamepadKey::Down => (
+            PhysicalKey::ArrowDown,
+            LogicalKey::Named(RuffleNamedKey::ArrowDown),
+        ),
+        GamepadKey::Left => (
+            PhysicalKey::ArrowLeft,
+            LogicalKey::Named(RuffleNamedKey::ArrowLeft),
+        ),
+        GamepadKey::Right => (
+            PhysicalKey::ArrowRight,
+            LogicalKey::Named(RuffleNamedKey::ArrowRight),
+        ),
+        GamepadKey::Space => (PhysicalKey::Space, LogicalKey::Character(' ')),
+    };
+    KeyDescriptor {
+        physical_key,
+        logical_key,
+        key_location: KeyLocation::Standard,
+    }
+}
