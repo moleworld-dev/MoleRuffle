@@ -383,18 +383,17 @@ impl App {
             0
         };
 
-        // 常驻库位图纹理数/显存 + 每秒逐出数(来自 fork 的 ruffle_render::evict 计数器)。
+        // 离屏渲染目标累计创建显存(实测发现的内存大头:cacheAsBitmap/滤镜/帧缓冲/池)+ 源位图常驻(=0)。
         use std::sync::atomic::Ordering::Relaxed;
-        let res_tex = ruffle_render::evict::RESIDENT_TEXTURES.load(Relaxed);
+        let off_mb = ruffle_render::evict::OFFSCREEN_BYTES.load(Relaxed) / (1024 * 1024);
         let res_mb = ruffle_render::evict::RESIDENT_BYTES.load(Relaxed) / (1024 * 1024);
-        let ev_total = ruffle_render::evict::EVICTIONS_TOTAL.load(Relaxed);
-        let ev_s = (ev_total.saturating_sub(self.last_evict)) as f64 / since.as_secs_f64().max(0.001);
-        self.last_evict = ev_total;
+        // 周期把 软件/离屏 打到 console,我据此定位与量化内存大头(不依赖你读 HUD)。
+        tracing::info!("[mem] 软件 {foot}MB | 离屏 {off_mb}MB | 源位图 {res_mb}MB | 余量 {avail}MB");
 
         // 刷新 HUD 文本。
         if let Some(hud) = &self.hud {
             let text = format!(
-                "FPS {fps}\n内存 软件{foot} / 系统{total} MB\n余量 {avail} MB  温度 {temp}\n渲染 {api}\n常驻 {res_tex} 张 / {res_mb} MB  逐出 {ev_s:.0}/s\n网络 {net}   内核 {rev}",
+                "FPS {fps}\n内存 软件{foot} / 系统{total} MB\n余量 {avail} MB  温度 {temp}\n渲染 {api}\n离屏 {off_mb}MB  源位图 {res_mb}MB\n网络 {net}   内核 {rev}",
                 temp = ios_debug_hud::thermal_state(),
                 api = self.render_api,
                 net = ios_debug_hud::network_status(),
