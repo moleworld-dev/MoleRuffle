@@ -104,6 +104,10 @@ struct App {
     last_evict: u64,
     /// 上次执行库位图逐出的时刻(Phase 2-A 实验:定期逐出以观测真实内存是否回落)。
     last_evict_run: Instant,
+    /// 上次取样的离屏池累计创建字节,用于算池 churn 速率(MB/s)。
+    last_offscreen: u64,
+    /// 上次取样的 create_empty 累计创建字节,用于算 create_empty churn 速率(MB/s)。
+    last_empty: u64,
     /// iOS 绿色调试 HUD(左上角实时 FPS/内存/网络/渲染API/内核/温度)。
     #[cfg(target_os = "ios")]
     hud: Option<ios_debug_hud::DebugHud>,
@@ -225,6 +229,8 @@ impl App {
             last_hud_frames: 0,
             last_evict: 0,
             last_evict_run: Instant::now(),
+            last_offscreen: 0,
+            last_empty: 0,
             #[cfg(target_os = "ios")]
             hud: None,
         })
@@ -383,17 +389,21 @@ impl App {
             0
         };
 
-        // 离屏渲染目标累计创建显存(实测发现的内存大头:cacheAsBitmap/滤镜/帧缓冲/池)+ 源位图常驻(=0)。
+        // 两路 churn 速率(MB/s):分清是离屏池 还是 create_empty(cacheAsBitmap 目标)在每帧重建。
         use std::sync::atomic::Ordering::Relaxed;
-        let off_mb = ruffle_render::evict::OFFSCREEN_BYTES.load(Relaxed) / (1024 * 1024);
-        let res_mb = ruffle_render::evict::RESIDENT_BYTES.load(Relaxed) / (1024 * 1024);
-        // 周期把 软件/离屏 打到 console,我据此定位与量化内存大头(不依赖你读 HUD)。
-        tracing::info!("[mem] 软件 {foot}MB | 离屏 {off_mb}MB | 源位图 {res_mb}MB | 余量 {avail}MB");
+        let dt = since.as_secs_f64().max(0.001);
+        let off_now = ruffle_render::evict::OFFSCREEN_BYTES.load(Relaxed);
+        let pool_mb_s = (off_now.saturating_sub(self.last_offscreen)) as f64 / dt / (1024.0 * 1024.0);
+        self.last_offscreen = off_now;
+        let empty_now = ruffle_render::evict::EMPTY_BYTES.load(Relaxed);
+        let empty_mb_s = (empty_now.saturating_sub(self.last_empty)) as f64 / dt / (1024.0 * 1024.0);
+        self.last_empty = empty_now;
+        tracing::info!("[mem] 软件 {foot}MB | 池churn {pool_mb_s:.0} | emptychurn {empty_mb_s:.0} MB/s | 余量 {avail}MB");
 
         // 刷新 HUD 文本。
         if let Some(hud) = &self.hud {
             let text = format!(
-                "FPS {fps}\n内存 软件{foot} / 系统{total} MB\n余量 {avail} MB  温度 {temp}\n渲染 {api}\n离屏 {off_mb}MB  源位图 {res_mb}MB\n网络 {net}   内核 {rev}",
+                "FPS {fps}\n内存 软件{foot} / 系统{total} MB\n余量 {avail} MB  温度 {temp}\n渲染 {api}\n池churn {pool_mb_s:.0} empty {empty_mb_s:.0} MB/s\n网络 {net}   内核 {rev}",
                 temp = ios_debug_hud::thermal_state(),
                 api = self.render_api,
                 net = ios_debug_hud::network_status(),
