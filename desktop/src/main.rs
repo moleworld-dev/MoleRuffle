@@ -45,6 +45,9 @@ mod ios_textbar;
 #[cfg(target_os = "ios")]
 #[allow(dead_code)]
 mod ios_debug_hud;
+/// iOS 屏幕虚拟手柄(方向键+空格+切换钮,原生叠层 + 坐标命中注入按键)。
+#[cfg(target_os = "ios")]
+mod ios_gamepad;
 
 /// winit 自定义事件:把 Ruffle 的异步任务调度回事件循环线程执行。
 enum UserEvent {
@@ -111,6 +114,12 @@ struct App {
     /// iOS 绿色调试 HUD(左上角实时 FPS/内存/网络/渲染API/内核/温度)。
     #[cfg(target_os = "ios")]
     hud: Option<ios_debug_hud::DebugHud>,
+    /// iOS 屏幕虚拟手柄(方向键+空格+切换钮)。
+    #[cfg(target_os = "ios")]
+    gamepad: Option<ios_gamepad::GamePad>,
+    /// 正在按住虚拟手柄键的触摸:touch id → 键(支持按住持续走 + 多指同时按方向+空格)。
+    #[cfg(target_os = "ios")]
+    gamepad_touches: std::collections::HashMap<u64, keymap::GamepadKey>,
 }
 
 /// 进入 tokio 运行时上下文(reqwest / socket 异步依赖它)。
@@ -233,6 +242,10 @@ impl App {
             last_empty: 0,
             #[cfg(target_os = "ios")]
             hud: None,
+            #[cfg(target_os = "ios")]
+            gamepad: None,
+            #[cfg(target_os = "ios")]
+            gamepad_touches: std::collections::HashMap::new(),
         })
     }
 
@@ -503,6 +516,16 @@ impl ApplicationHandler<UserEvent> for App {
             tracing::info!("iOS 调试 HUD {}", if self.hud.is_some() { "已创建" } else { "创建失败" });
             // Phase 2-A 实验:开启定期逐出,观测真实 footprint 是否随常驻回落。
             ruffle_render::evict::set_evict(IOS_EVICT_EXPERIMENT);
+            // 屏幕虚拟手柄(方向键+空格+切换钮),初始隐藏面板、切换钮常驻。
+            self.gamepad = ios_gamepad::GamePad::new(&window);
+            if let Some(gp) = self.gamepad.as_mut() {
+                let scale = window.scale_factor();
+                let (w_px, h_px) = surface_dims(&window);
+                gp.layout(w_px as f64 / scale, h_px as f64 / scale, scale);
+                tracing::info!("iOS 虚拟手柄已创建");
+            } else {
+                tracing::warn!("iOS 虚拟手柄创建失败");
+            }
         }
         self.window = Some(window);
         self.player = Some(player);
@@ -596,7 +619,11 @@ impl ApplicationHandler<UserEvent> for App {
             //   这里把单指触摸翻译成鼠标:按下=移动到该点+按下,移动=拖动,抬起=移动到落点+松开。
             //   没有这段,手机上点任何东西都没反应。location 是物理像素,与 ViewportDimensions 一致。
             WindowEvent::Touch(Touch {
-                phase, location, ..
+                phase,
+                location,
+                #[cfg(target_os = "ios")]
+                id,
+                ..
             }) => {
                 let (x, y) = (location.x, location.y);
                 self.mouse_pos = location;
@@ -617,6 +644,43 @@ impl ApplicationHandler<UserEvent> for App {
                                 p.handle_event(PlayerEvent::TextControl { code })
                             });
                             tracing::info!("文本工具条:{name}");
+                        }
+                        return;
+                    }
+                }
+                // iOS:虚拟手柄(方向键/空格/切换钮)。用全屏物理像素命中(与布局同坐标系)。
+                // 按下命中方向/空格 → KeyDown 并记 id→键(按住持续走);抬起 → KeyUp。切换钮 → 显隐面板。
+                // 命中(或正按住)的触摸一律吞掉,不转发为游戏点击。
+                #[cfg(target_os = "ios")]
+                {
+                    let held = self.gamepad_touches.get(&id).copied();
+                    let hit = if phase == TouchPhase::Started {
+                        self.gamepad.as_ref().and_then(|gp| gp.hit_test(x, y))
+                    } else {
+                        None
+                    };
+                    if held.is_some() || hit.is_some() {
+                        match phase {
+                            TouchPhase::Started => match hit {
+                                Some(ios_gamepad::GamepadHit::Toggle) => {
+                                    if let Some(gp) = self.gamepad.as_mut() {
+                                        gp.toggle();
+                                    }
+                                }
+                                Some(ios_gamepad::GamepadHit::Key(k)) => {
+                                    self.gamepad_touches.insert(id, k);
+                                    let key = keymap::gamepad_key_descriptor(k);
+                                    self.with_player(|p| p.handle_event(PlayerEvent::KeyDown { key }));
+                                }
+                                None => {}
+                            },
+                            TouchPhase::Ended | TouchPhase::Cancelled => {
+                                if let Some(k) = self.gamepad_touches.remove(&id) {
+                                    let key = keymap::gamepad_key_descriptor(k);
+                                    self.with_player(|p| p.handle_event(PlayerEvent::KeyUp { key }));
+                                }
+                            }
+                            TouchPhase::Moved => { /* 按住中,吞掉,保持 KeyDown */ }
                         }
                         return;
                     }
