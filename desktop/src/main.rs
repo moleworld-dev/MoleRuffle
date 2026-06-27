@@ -102,6 +102,8 @@ struct App {
     last_hud_frames: u64,
     /// 上次 HUD 取样时的累计逐出数,用于算每秒逐出数。
     last_evict: u64,
+    /// 上次执行库位图逐出的时刻(Phase 2-A 实验:定期逐出以观测真实内存是否回落)。
+    last_evict_run: Instant,
     /// iOS 绿色调试 HUD(左上角实时 FPS/内存/网络/渲染API/内核/温度)。
     #[cfg(target_os = "ios")]
     hud: Option<ios_debug_hud::DebugHud>,
@@ -139,6 +141,12 @@ fn surface_dims(window: &Window) -> (u32, u32) {
 /// ① `increased-memory-limit` entitlement 把墙抬到 ~9GB(见 ios/MoleRuffle.entitlements),1.0 峰值塞得下;
 /// ② 运行时观测内存 + 余量过低时主动重置纹理池回收显存(见 RedrawRequested 里的 mem 逻辑)。
 /// 故全平台统一 1.0 真高清。若极端机型仍紧,可临时降到 0.85(2438×1122,仍远超 960×560 源美术)。
+// 实测纠正:摩尔庄园的显存/发热大头是**离屏渲染目标**(cacheAsBitmap/滤镜/帧缓冲,随 render_scale
+// 面积平方缩放),不是源位图(register_bitmap 实测=0、库里 0 个 Bitmap)。故 render_scale 是同时
+// 管内存与发热的主杠杆。iOS 取 0.8(2294×1056,离屏面积 −36%,明显降热,仍 >2x 源美术 960×560);桌面 1.0。
+#[cfg(target_os = "ios")]
+const RENDER_SCALE: f64 = 0.8;
+#[cfg(not(target_os = "ios"))]
 const RENDER_SCALE: f64 = 1.0;
 
 /// 自适应内存守卫阈值(iOS)。研究结论:~5GB 足迹里 ~3-4GB 是 Ruffle 不压缩的解码位图(动不了),
@@ -150,6 +158,13 @@ const RENDER_SCALE: f64 = 1.0;
 const MEM_SOFT_FLOOR_MB: u64 = 1500;
 #[cfg(target_os = "ios")]
 const MEM_URGENT_MB: u64 = 700;
+
+/// Phase 2-A 实验开关:iOS 无法设 env,用此常量开启"定期逐出库位图"以观测真实内存是否回落。
+/// 测完(确认符号 vs shape填充 比例)再定方向:接到守卫 / 或上 Phase B 网格逐出。
+// 实测结论:摩尔庄园库里 0 个 DefineBits 位图(逐出空集、无效),且内存在离屏目标不在源位图。
+// 故关闭源位图逐出实验(它对本游戏无用且每 tick 刷日志);真正的省内存/降热靠上面的 render_scale。
+#[cfg(target_os = "ios")]
+const IOS_EVICT_EXPERIMENT: bool = false;
 
 /// 喂给 wgpu surface / 引擎 viewport 的渲染尺寸(物理像素 × RENDER_SCALE)。
 /// 注意:**触摸坐标也必须 ×RENDER_SCALE** 才与缩小后的 viewport 一致(见 Touch 处理),
@@ -209,6 +224,7 @@ impl App {
             render_api: String::from("?"),
             last_hud_frames: 0,
             last_evict: 0,
+            last_evict_run: Instant::now(),
             #[cfg(target_os = "ios")]
             hud: None,
         })
@@ -410,6 +426,21 @@ impl App {
                 }
             }
         }
+
+        // Phase 2-A 实验:逐出库位图,从 console 内存曲线判断"清句柄"是否真省内存。
+        // 软件足迹随逐出回落=清句柄有效(符号为主,A 够);常驻掉但软件不掉=纹理被缓存 Mesh 的
+        // TextureView 钉住(shape填充为主,需 Phase B)。逐出调稀到 15s 以降发热(每次逐出都触发重解码)。
+        if ruffle_render::evict::evict_enabled() {
+            let res_mb = ruffle_render::evict::RESIDENT_BYTES.load(Relaxed) / (1024 * 1024);
+            // 每 tick(~0.5s)打内存曲线,我从 console 读逐出前后软件足迹变化。
+            tracing::info!("[mem] 软件 {foot}MB | 常驻 {res_mb}MB | 余量 {avail}MB");
+            if self.last_evict_run.elapsed().as_secs() >= 15 {
+                self.last_evict_run = Instant::now();
+                let n = self.with_player(|p| p.evict_bitmap_handles()).unwrap_or(0);
+                ruffle_render::evict::EVICTIONS_TOTAL.fetch_add(n as u64, Relaxed);
+                tracing::warn!("[逐出] {n} 张(此刻软件 {foot}MB)→ 看后续 [mem] 软件跌不跌");
+            }
+        }
     }
 }
 
@@ -461,6 +492,8 @@ impl ApplicationHandler<UserEvent> for App {
             }
             self.hud = ios_debug_hud::DebugHud::new(&window);
             tracing::info!("iOS 调试 HUD {}", if self.hud.is_some() { "已创建" } else { "创建失败" });
+            // Phase 2-A 实验:开启定期逐出,观测真实 footprint 是否随常驻回落。
+            ruffle_render::evict::set_evict(IOS_EVICT_EXPERIMENT);
         }
         self.window = Some(window);
         self.player = Some(player);
@@ -742,6 +775,30 @@ impl ApplicationHandler<UserEvent> for App {
             if since.as_millis() >= 500 {
                 self.last_mem_check = now;
                 self.mem_hud_tick(since);
+            }
+        }
+
+        // 桌面实测(Phase 2-A):每 ~4s 打印常驻库位图计数;若 MOLE_TEXTURE_EVICT=1 则逐出并记录前后。
+        // 用外部 `ps -o rss= -p <pid>` 对比进程 RSS:若 RSS 跟着常驻一起掉 → 清句柄真省内存(符号为主);
+        // 若常驻掉了但 RSS 不掉 → 纹理被缓存 Mesh 的 TextureView 钉住(需 Phase B 网格逐出)。
+        #[cfg(not(target_os = "ios"))]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let since = self.last_mem_check.elapsed();
+            if since.as_secs() >= 4 {
+                self.last_mem_check = now;
+                let res_tex = ruffle_render::evict::RESIDENT_TEXTURES.load(Relaxed);
+                let before = ruffle_render::evict::RESIDENT_BYTES.load(Relaxed) / (1024 * 1024);
+                if ruffle_render::evict::evict_enabled() {
+                    let n = self.with_player(|p| p.evict_bitmap_handles()).unwrap_or(0);
+                    ruffle_render::evict::EVICTIONS_TOTAL.fetch_add(n as u64, Relaxed);
+                    let after = ruffle_render::evict::RESIDENT_BYTES.load(Relaxed) / (1024 * 1024);
+                    tracing::info!(
+                        "[逐出] {n} 张 | 常驻 {res_tex}张 {before}→{after}MB(用 ps 量进程 RSS 看是否真释放)"
+                    );
+                } else {
+                    tracing::info!("[观测] 常驻库位图 {res_tex} 张 / {before} MB(逐出关;设 MOLE_TEXTURE_EVICT=1 开)");
+                }
             }
         }
 
