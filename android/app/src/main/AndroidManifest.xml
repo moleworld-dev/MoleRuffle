@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- MoleRuffle:性能 HUD 显示网络状态(WiFi/蜂窝/离线)。 -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <application
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
+        android:theme="@style/Theme.Ruffle"
+        tools:targetApi="31">
+        <!-- MoleRuffle:官方 ruffle 的选文件首页,我们不用它当入口(改由 PlayerActivity 直接启动进摩尔庄园);
+             保留以备将来打开本地 swf,但不再是 LAUNCHER。 -->
+        <activity
+            android:name=".MainActivity"
+            android:launchMode="singleTask"
+            android:exported="false" />
+        <activity
+            android:name=".PanicActivity"
+            android:launchMode="singleTask"
+            android:exported="false">
+        </activity>
+        <activity
+            android:name=".PlayerActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|screenLayout|density|uiMode|smallestScreenSize"
+
+            android:screenOrientation="sensorLandscape"
+            >
+            <meta-data android:name="android.app.lib_name" android:value="ruffle_android" />
+
+            <!-- MoleRuffle:桌面图标直接启动进摩尔庄园(原生硬编码 mole.61.com,无需选文件)。 -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Handle only flash related files ( .swf, .spl) -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <category android:name="android.intent.category.OPENABLE"/>
+                <data android:scheme="file"/>
+                <data android:scheme="content"/>
+                <data android:scheme="http"/>
+                <data android:scheme="https"/>
+                <data android:mimeType="application/x-shockwave-flash"/>
+                <data android:mimeType="application/futuresplash"/>
+            </intent-filter>
+
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <category android:name="android.intent.category.OPENABLE"/>
+                <data android:scheme="file"/>
+                <data android:scheme="content"/>
+                <data android:scheme="http"/>
+                <data android:scheme="https"/>
+                <data android:mimeType="*/*"/>
+                <data android:host="*"/>
+                <data android:pathPattern=".*\\.swf"/> <!-- match .swf / .SWF with multiple dots for backwards compatibility -->
+                <data android:pathPattern=".*\\.SWF"/>
+                <data android:pathPattern=".*\\..*\\.swf"/>
+                <data android:pathPattern=".*\\..*\\.SWF"/>
+                <data android:pathPattern=".*\\..*\\..*\\.swf"/>
+                <data android:pathPattern=".*\\..*\\..*\\.SWF"/>
+                <data android:pathPattern=".*\\.spl"/>
+                <data android:pathPattern=".*\\.SPL"/>
+                <data android:pathPattern=".*\\..*\\.spl"/>
+                <data android:pathPattern=".*\\..*\\.SPL"/>
+                <data android:pathPattern=".*\\..*\\..*\\.spl"/>
+                <data android:pathPattern=".*\\..*\\..*\\.SPL"/>
+                <data android:pathSuffix="swf"/> <!-- support Android 12+ pathSuffix -->
+                <data android:pathSuffix="SWF"/>
+                <data android:pathSuffix="spl"/>
+                <data android:pathSuffix="SPL"/>
+            </intent-filter>
+
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW"/>
+                <category android:name="android.intent.category.DEFAULT"/>
+                <category android:name="android.intent.category.BROWSABLE"/>
+                <data android:scheme="file"/>
+                <data android:scheme="http"/>
+                <data android:scheme="https"/>
+                <data android:host="*"/>
+                <data android:pathPattern=".*\\.swf"/> <!-- match .swf / .SWF with multiple dots for backwards compatibility -->
+                <data android:pathPattern=".*\\.SWF"/>
+                <data android:pathPattern=".*\\..*\\.swf"/>
+                <data android:pathPattern=".*\\..*\\.SWF"/>
+                <data android:pathPattern=".*\\..*\\..*\\.swf"/>
+                <data android:pathPattern=".*\\..*\\..*\\.SWF"/>
+                <data android:pathPattern=".*\\.spl"/>
+                <data android:pathPattern=".*\\.SPL"/>
+                <data android:pathPattern=".*\\..*\\.spl"/>
+                <data android:pathPattern=".*\\..*\\.SPL"/>
+                <data android:pathPattern=".*\\..*\\..*\\.spl"/>
+                <data android:pathPattern=".*\\..*\\..*\\.SPL"/>
+                <data android:pathSuffix="swf"/> <!-- support Android 12+ pathSuffix -->
+                <data android:pathSuffix="SWF"/>
+                <data android:pathSuffix="spl"/>
+                <data android:pathSuffix="SPL"/>
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
