@@ -30,8 +30,8 @@
 MoleRuffle/
 ├── crates/moleruffle-core/   # 五端共享:摩尔庄园配置 + Player 装配 + spoof + socket 放行 + 中文字体
 ├── desktop/                  # Win/macOS/Linux 壳(winit + wgpu)  →  binary: moleruffle
-├── android/                  # Android 壳(规划中,fork ruffle-android)
-├── ios/                      # iOS 壳(规划中,参照 madsmtm/ruffle-ios + wgpu/Metal)
+├── android/                  # Android 壳(fork 官方 ruffle-android,真机已出登录界面,打磨中)
+├── ios/                      # iOS 壳(已实装:xcodeproj + 自签/TestFlight 脚本,内部测试中)
 └── docs/ARCHITECTURE.md
 ```
 
@@ -48,11 +48,13 @@ cargo build --release -p moleruffle-desktop && ./target/release/moleruffle
 ## 路线图
 
 - [x] **Phase 0** — 验证 Ruffle 能在线跑通摩尔庄园(macOS 桌面,已实测)
-- [ ] **Phase 1** — macOS 薄壳(本仓库当前阶段)
-- [ ] **Phase 2** — Android 在线可玩(真机帧率/触摸实测)
+- [x] **Phase 1** — macOS 薄壳(已跑通:窗口直接加载登录页,`cargo run` 即玩)
+- [~] **Phase 2** — Android:fork 官方 ruffle-android,真机已出登录界面,横屏/中文字体/收键盘打磨中
 - [ ] **Phase 3** — Windows + Linux 平移
-- [ ] **Phase 4** — iOS 自用打通(wgpu/Metal + 自签/内部分发)
+- [~] **Phase 4** — iOS:原生壳已实装(wgpu/Metal + 自签/TestFlight),内部测试中
 - [ ] **Phase 5** — 全玩法点亮(钓鱼/卡丁车/小屋…)+ 中文字体内置 + 回归加固
+
+> 图例:`[x]` 已完成 · `[~]` 进行中 · `[ ]` 待办
 
 ## License
 
