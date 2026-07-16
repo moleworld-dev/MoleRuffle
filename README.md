@@ -1,5 +1,11 @@
 # MoleRuffle
 
+[![平台](https://img.shields.io/badge/平台-Windows_·_macOS_·_Linux_·_Android_·_iOS-4c8bf5?style=flat-square)](#)
+[![引擎 Ruffle](https://img.shields.io/badge/引擎-Ruffle-f28f1c?style=flat-square)](https://github.com/ruffle-rs/ruffle)
+[![Rust](https://img.shields.io/badge/Rust-000000?style=flat-square&logo=rust&logoColor=white)](https://www.rust-lang.org)
+[![License](https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue?style=flat-square)](#license)
+[![官网](https://img.shields.io/badge/官网-moleworld.net-2ea44f?style=flat-square)](https://moleworld.net)
+
 专为 **摩尔庄园网页版**(`mole.61.com`)量身定制的跨平台原生客户端,基于 [Ruffle](https://github.com/ruffle-rs/ruffle) 引擎,用 Rust 编写。
 
 目标:**Windows / macOS / Linux / Android / iOS** 五端,开箱即在线进入游戏,高性能、原生体验。
