@@ -45,6 +45,9 @@ mod ios_textbar;
 #[cfg(target_os = "ios")]
 #[allow(dead_code)]
 mod ios_debug_hud;
+/// iOS 屏幕虚拟手柄(方向键+空格+切换钮,原生叠层 + 坐标命中注入按键)。
+#[cfg(target_os = "ios")]
+mod ios_gamepad;
 
 /// winit 自定义事件:把 Ruffle 的异步任务调度回事件循环线程执行。
 enum UserEvent {
@@ -100,9 +103,23 @@ struct App {
     render_api: String,
     /// 上次 HUD 取样时的渲染帧数,用于算实时 FPS。
     last_hud_frames: u64,
+    /// 上次 HUD 取样时的累计逐出数,用于算每秒逐出数。
+    last_evict: u64,
+    /// 上次执行库位图逐出的时刻(Phase 2-A 实验:定期逐出以观测真实内存是否回落)。
+    last_evict_run: Instant,
+    /// 上次取样的离屏池累计创建字节,用于算池 churn 速率(MB/s)。
+    last_offscreen: u64,
+    /// 上次取样的 create_empty 累计创建字节,用于算 create_empty churn 速率(MB/s)。
+    last_empty: u64,
     /// iOS 绿色调试 HUD(左上角实时 FPS/内存/网络/渲染API/内核/温度)。
     #[cfg(target_os = "ios")]
     hud: Option<ios_debug_hud::DebugHud>,
+    /// iOS 屏幕虚拟手柄(方向键+空格+切换钮)。
+    #[cfg(target_os = "ios")]
+    gamepad: Option<ios_gamepad::GamePad>,
+    /// 正在按住虚拟手柄键的触摸:touch id → 键(支持按住持续走 + 多指同时按方向+空格)。
+    #[cfg(target_os = "ios")]
+    gamepad_touches: std::collections::HashMap<u64, keymap::GamepadKey>,
 }
 
 /// 进入 tokio 运行时上下文(reqwest / socket 异步依赖它)。
@@ -137,6 +154,12 @@ fn surface_dims(window: &Window) -> (u32, u32) {
 /// ① `increased-memory-limit` entitlement 把墙抬到 ~9GB(见 ios/MoleRuffle.entitlements),1.0 峰值塞得下;
 /// ② 运行时观测内存 + 余量过低时主动重置纹理池回收显存(见 RedrawRequested 里的 mem 逻辑)。
 /// 故全平台统一 1.0 真高清。若极端机型仍紧,可临时降到 0.85(2438×1122,仍远超 960×560 源美术)。
+// 实测纠正:摩尔庄园的显存/发热大头是**离屏渲染目标**(cacheAsBitmap/滤镜/帧缓冲,随 render_scale
+// 面积平方缩放),不是源位图(register_bitmap 实测=0、库里 0 个 Bitmap)。故 render_scale 是同时
+// 管内存与发热的主杠杆。iOS 取 0.8(2294×1056,离屏面积 −36%,明显降热,仍 >2x 源美术 960×560);桌面 1.0。
+#[cfg(target_os = "ios")]
+const RENDER_SCALE: f64 = 0.8;
+#[cfg(not(target_os = "ios"))]
 const RENDER_SCALE: f64 = 1.0;
 
 /// 自适应内存守卫阈值(iOS)。研究结论:~5GB 足迹里 ~3-4GB 是 Ruffle 不压缩的解码位图(动不了),
@@ -148,6 +171,13 @@ const RENDER_SCALE: f64 = 1.0;
 const MEM_SOFT_FLOOR_MB: u64 = 1500;
 #[cfg(target_os = "ios")]
 const MEM_URGENT_MB: u64 = 700;
+
+/// Phase 2-A 实验开关:iOS 无法设 env,用此常量开启"定期逐出库位图"以观测真实内存是否回落。
+/// 测完(确认符号 vs shape填充 比例)再定方向:接到守卫 / 或上 Phase B 网格逐出。
+// 实测结论:摩尔庄园库里 0 个 DefineBits 位图(逐出空集、无效),且内存在离屏目标不在源位图。
+// 故关闭源位图逐出实验(它对本游戏无用且每 tick 刷日志);真正的省内存/降热靠上面的 render_scale。
+#[cfg(target_os = "ios")]
+const IOS_EVICT_EXPERIMENT: bool = false;
 
 /// 喂给 wgpu surface / 引擎 viewport 的渲染尺寸(物理像素 × RENDER_SCALE)。
 /// 注意:**触摸坐标也必须 ×RENDER_SCALE** 才与缩小后的 viewport 一致(见 Touch 处理),
@@ -206,8 +236,16 @@ impl App {
             textbar: None,
             render_api: String::from("?"),
             last_hud_frames: 0,
+            last_evict: 0,
+            last_evict_run: Instant::now(),
+            last_offscreen: 0,
+            last_empty: 0,
             #[cfg(target_os = "ios")]
             hud: None,
+            #[cfg(target_os = "ios")]
+            gamepad: None,
+            #[cfg(target_os = "ios")]
+            gamepad_touches: std::collections::HashMap::new(),
         })
     }
 
@@ -364,10 +402,21 @@ impl App {
             0
         };
 
+        // 两路 churn 速率(MB/s):分清是离屏池 还是 create_empty(cacheAsBitmap 目标)在每帧重建。
+        use std::sync::atomic::Ordering::Relaxed;
+        let dt = since.as_secs_f64().max(0.001);
+        let off_now = ruffle_render::evict::OFFSCREEN_BYTES.load(Relaxed);
+        let pool_mb_s = (off_now.saturating_sub(self.last_offscreen)) as f64 / dt / (1024.0 * 1024.0);
+        self.last_offscreen = off_now;
+        let empty_now = ruffle_render::evict::EMPTY_BYTES.load(Relaxed);
+        let empty_mb_s = (empty_now.saturating_sub(self.last_empty)) as f64 / dt / (1024.0 * 1024.0);
+        self.last_empty = empty_now;
+        tracing::info!("[mem] 软件 {foot}MB | 池churn {pool_mb_s:.0} | emptychurn {empty_mb_s:.0} MB/s | 余量 {avail}MB");
+
         // 刷新 HUD 文本。
         if let Some(hud) = &self.hud {
             let text = format!(
-                "FPS {fps}\n内存 软件{foot} / 系统{total} MB\n余量 {avail} MB  温度 {temp}\n渲染 {api}\n网络 {net}   内核 {rev}",
+                "FPS {fps}\n内存 软件{foot} / 系统{total} MB\n余量 {avail} MB  温度 {temp}\n渲染 {api}\n池churn {pool_mb_s:.0} empty {empty_mb_s:.0} MB/s\n网络 {net}   内核 {rev}",
                 temp = ios_debug_hud::thermal_state(),
                 api = self.render_api,
                 net = ios_debug_hud::network_status(),
@@ -397,6 +446,21 @@ impl App {
                         if urgent { "(急)" } else { "" }
                     );
                 }
+            }
+        }
+
+        // Phase 2-A 实验:逐出库位图,从 console 内存曲线判断"清句柄"是否真省内存。
+        // 软件足迹随逐出回落=清句柄有效(符号为主,A 够);常驻掉但软件不掉=纹理被缓存 Mesh 的
+        // TextureView 钉住(shape填充为主,需 Phase B)。逐出调稀到 15s 以降发热(每次逐出都触发重解码)。
+        if ruffle_render::evict::evict_enabled() {
+            let res_mb = ruffle_render::evict::RESIDENT_BYTES.load(Relaxed) / (1024 * 1024);
+            // 每 tick(~0.5s)打内存曲线,我从 console 读逐出前后软件足迹变化。
+            tracing::info!("[mem] 软件 {foot}MB | 常驻 {res_mb}MB | 余量 {avail}MB");
+            if self.last_evict_run.elapsed().as_secs() >= 15 {
+                self.last_evict_run = Instant::now();
+                let n = self.with_player(|p| p.evict_bitmap_handles()).unwrap_or(0);
+                ruffle_render::evict::EVICTIONS_TOTAL.fetch_add(n as u64, Relaxed);
+                tracing::warn!("[逐出] {n} 张(此刻软件 {foot}MB)→ 看后续 [mem] 软件跌不跌");
             }
         }
     }
@@ -450,6 +514,18 @@ impl ApplicationHandler<UserEvent> for App {
             }
             self.hud = ios_debug_hud::DebugHud::new(&window);
             tracing::info!("iOS 调试 HUD {}", if self.hud.is_some() { "已创建" } else { "创建失败" });
+            // Phase 2-A 实验:开启定期逐出,观测真实 footprint 是否随常驻回落。
+            ruffle_render::evict::set_evict(IOS_EVICT_EXPERIMENT);
+            // 屏幕虚拟手柄(方向键+空格+切换钮),初始隐藏面板、切换钮常驻。
+            self.gamepad = ios_gamepad::GamePad::new(&window);
+            if let Some(gp) = self.gamepad.as_mut() {
+                let scale = window.scale_factor();
+                let (w_px, h_px) = surface_dims(&window);
+                gp.layout(w_px as f64 / scale, h_px as f64 / scale, scale);
+                tracing::info!("iOS 虚拟手柄已创建");
+            } else {
+                tracing::warn!("iOS 虚拟手柄创建失败");
+            }
         }
         self.window = Some(window);
         self.player = Some(player);
@@ -543,7 +619,11 @@ impl ApplicationHandler<UserEvent> for App {
             //   这里把单指触摸翻译成鼠标:按下=移动到该点+按下,移动=拖动,抬起=移动到落点+松开。
             //   没有这段,手机上点任何东西都没反应。location 是物理像素,与 ViewportDimensions 一致。
             WindowEvent::Touch(Touch {
-                phase, location, ..
+                phase,
+                location,
+                #[cfg(target_os = "ios")]
+                id,
+                ..
             }) => {
                 let (x, y) = (location.x, location.y);
                 self.mouse_pos = location;
@@ -564,6 +644,43 @@ impl ApplicationHandler<UserEvent> for App {
                                 p.handle_event(PlayerEvent::TextControl { code })
                             });
                             tracing::info!("文本工具条:{name}");
+                        }
+                        return;
+                    }
+                }
+                // iOS:虚拟手柄(方向键/空格/切换钮)。用全屏物理像素命中(与布局同坐标系)。
+                // 按下命中方向/空格 → KeyDown 并记 id→键(按住持续走);抬起 → KeyUp。切换钮 → 显隐面板。
+                // 命中(或正按住)的触摸一律吞掉,不转发为游戏点击。
+                #[cfg(target_os = "ios")]
+                {
+                    let held = self.gamepad_touches.get(&id).copied();
+                    let hit = if phase == TouchPhase::Started {
+                        self.gamepad.as_ref().and_then(|gp| gp.hit_test(x, y))
+                    } else {
+                        None
+                    };
+                    if held.is_some() || hit.is_some() {
+                        match phase {
+                            TouchPhase::Started => match hit {
+                                Some(ios_gamepad::GamepadHit::Toggle) => {
+                                    if let Some(gp) = self.gamepad.as_mut() {
+                                        gp.toggle();
+                                    }
+                                }
+                                Some(ios_gamepad::GamepadHit::Key(k)) => {
+                                    self.gamepad_touches.insert(id, k);
+                                    let key = keymap::gamepad_key_descriptor(k);
+                                    self.with_player(|p| p.handle_event(PlayerEvent::KeyDown { key }));
+                                }
+                                None => {}
+                            },
+                            TouchPhase::Ended | TouchPhase::Cancelled => {
+                                if let Some(k) = self.gamepad_touches.remove(&id) {
+                                    let key = keymap::gamepad_key_descriptor(k);
+                                    self.with_player(|p| p.handle_event(PlayerEvent::KeyUp { key }));
+                                }
+                            }
+                            TouchPhase::Moved => { /* 按住中,吞掉,保持 KeyDown */ }
                         }
                         return;
                     }
@@ -734,6 +851,30 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
 
+        // 桌面实测(Phase 2-A):每 ~4s 打印常驻库位图计数;若 MOLE_TEXTURE_EVICT=1 则逐出并记录前后。
+        // 用外部 `ps -o rss= -p <pid>` 对比进程 RSS:若 RSS 跟着常驻一起掉 → 清句柄真省内存(符号为主);
+        // 若常驻掉了但 RSS 不掉 → 纹理被缓存 Mesh 的 TextureView 钉住(需 Phase B 网格逐出)。
+        #[cfg(not(target_os = "ios"))]
+        {
+            use std::sync::atomic::Ordering::Relaxed;
+            let since = self.last_mem_check.elapsed();
+            if since.as_secs() >= 4 {
+                self.last_mem_check = now;
+                let res_tex = ruffle_render::evict::RESIDENT_TEXTURES.load(Relaxed);
+                let before = ruffle_render::evict::RESIDENT_BYTES.load(Relaxed) / (1024 * 1024);
+                if ruffle_render::evict::evict_enabled() {
+                    let n = self.with_player(|p| p.evict_bitmap_handles()).unwrap_or(0);
+                    ruffle_render::evict::EVICTIONS_TOTAL.fetch_add(n as u64, Relaxed);
+                    let after = ruffle_render::evict::RESIDENT_BYTES.load(Relaxed) / (1024 * 1024);
+                    tracing::info!(
+                        "[逐出] {n} 张 | 常驻 {res_tex}张 {before}→{after}MB(用 ps 量进程 RSS 看是否真释放)"
+                    );
+                } else {
+                    tracing::info!("[观测] 常驻库位图 {res_tex} 张 / {before} MB(逐出关;设 MOLE_TEXTURE_EVICT=1 开)");
+                }
+            }
+        }
+
         // 睡到下一 SWF 帧(或被输入/异步事件提前唤醒),替代原来的 Poll 满速空转。
         el.set_control_flow(ControlFlow::WaitUntil(now + til));
     }
@@ -748,6 +889,9 @@ fn main() -> anyhow::Result<()> {
         tracing_subscriber::EnvFilter::new("warn,winit=error,ruffle=info,avm_trace=info,moleruffle=info")
     });
     tracing_subscriber::fmt().with_env_filter(filter).init();
+
+    // 纹理逐出开关:读 MOLE_TEXTURE_EVICT(Phase 1 不设=保持关=行为同现状)。
+    ruffle_render::evict::init_from_env();
 
     tracing::info!("MoleRuffle 桌面端启动,加载 {}", mole::GAME_SWF_URL);
 
