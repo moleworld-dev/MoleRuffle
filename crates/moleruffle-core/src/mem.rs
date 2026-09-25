@@ -114,3 +114,31 @@ pub fn total_ram_mb() -> u64 {
 pub fn total_ram_mb() -> u64 {
     0
 }
+
+/// 把 libmalloc 里"已 free 但仍占着物理页"的内存**真正还给系统**。
+///
+/// 为什么必须显式做:`force_gc` + 清纹理池只是让 Rust 侧 `drop`,`free()` 之后这些页通常还留在
+/// libmalloc 的 free list / magazine 里等着复用 —— 它们**仍然计入 `phys_footprint`,也就是仍然
+/// 计入 jetsam 的判杀口径**。于是会出现"守卫明明回收了几百 MB,足迹却几乎不降"的现象,
+/// 让守卫看起来没用、也真的救不回余量。
+///
+/// `malloc_zone_pressure_relief(NULL, 0)` 对所有 zone 做一次压力释放(等价系统在内存告警时
+/// 对各 zone 做的事),把空闲 span madvise/归还内核。返回值是释放的字节数。
+/// 代价:一次遍历 zone 的同步操作(毫秒级),所以只在守卫触发/内存告警这种低频路径调用,
+/// 绝不能每帧调。
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+pub fn relieve_malloc_pressure() -> u64 {
+    use std::os::raw::c_void;
+    unsafe extern "C" {
+        /// `size_t malloc_zone_pressure_relief(malloc_zone_t *zone, size_t goal)`
+        /// zone = NULL → 对所有 zone 生效;goal = 0 → 尽可能多地释放。
+        fn malloc_zone_pressure_relief(zone: *mut c_void, goal: usize) -> usize;
+    }
+    // SAFETY: NULL zone + goal 0 是该 API 文档化的"全量释放"用法,无内存所有权转移。
+    unsafe { malloc_zone_pressure_relief(core::ptr::null_mut(), 0) as u64 }
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+pub fn relieve_malloc_pressure() -> u64 {
+    0
+}
