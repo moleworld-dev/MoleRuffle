@@ -2474,6 +2474,7 @@ dependencies = [
  "async-channel",
  "dirs",
  "encoding_rs",
+ "flate2",
  "fontdb",
  "indexmap",
  "objc2-foundation 0.2.2",
