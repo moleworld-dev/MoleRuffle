@@ -60,6 +60,10 @@ pub fn apply_mole_settings(builder: PlayerBuilder) -> PlayerBuilder {
     // 不调此函数,拿逐字节上游行为,隔离成立)。live 读 env,启动期 set_var 立即生效。
     // SAFETY: 本函数在客户端启动期(SWF 加载前)单线程调用一次,无并发 env 读写竞争。
     unsafe { std::env::set_var("MOLE_LOADER_EAGER_CONSTRUCT", "1"); }
+    // 影片背景色生效前用黑色清屏(fork 默认白色):iOS 启动屏是黑的,等 Client.swf 那几秒
+    // 整屏闪白很刺眼。影片自己的背景色一旦生效照常使用。见 ruffle-fork player.rs。
+    // SAFETY: 同上,启动期单线程调用。
+    unsafe { std::env::set_var("MOLE_DEFAULT_BG_BLACK", "1"); }
 
     // 画质/MSAA:iOS 真机关 MSAA(Low=1x)。Apple GPU 最大 4x MSAA,High8x8 在真机被钳到 4x、
     // 仍要按全屏物理像素(~2868×1320)分配 ~90MB+ MSAA framebuffer,且乘进每个滤镜/cacheAsBitmap
@@ -79,6 +83,21 @@ pub fn apply_mole_settings(builder: PlayerBuilder) -> PlayerBuilder {
         Ok("high8x8") => StageQuality::High8x8,
         _ => default_quality,
     };
+    // ★舞台贴顶(仅移动端)★:折叠屏展开 / iPad 这类比舞台 960:560 更"方"的屏幕上,
+    //   ShowAll 默认把游戏垂直居中,上下各留一条窄黑边,虚拟手柄只能压在游戏上。贴顶后
+    //   两条窄边合成底部一整条,手柄放进去完全不挡画面(见 desktop/src/pad_layout.rs)。
+    //   普通手机横屏比舞台更宽,垂直方向没有余量(build_matrices 里 height_delta=0),
+    //   贴顶与居中结果完全一样,所以对普通手机零影响;且对齐只含 TOP,水平仍居中。
+    //   强制(force)防止 SWF 自己改 stage.align 把它挪回去。桌面窗口没有手柄,保持居中。
+    //   ★配套★:上游只在对齐为空时画黑边,强制贴顶会让黑边消失、两侧露出白色舞台背景和舞台外
+    //   内容(实测 iPhone 两侧白边)。MOLE_LETTERBOX_FORCED_ALIGN 让 fork 在宿主强制对齐时照样画黑边。
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    let builder = {
+        // SAFETY: 同上,启动期单线程调用。
+        unsafe { std::env::set_var("MOLE_LETTERBOX_FORCED_ALIGN", "1"); }
+        builder.with_align(ruffle_core::StageAlign::TOP, true)
+    };
+
     builder
         .with_autoplay(true)
         .with_letterbox(Letterbox::On)

@@ -38,6 +38,9 @@ use winit::window::{Window, WindowId};
 use moleruffle_core as mole;
 
 mod keymap;
+/// 虚拟手柄自适应布局(纯函数;iOS 用,安卓壳按此移植;桌面仅跑单测)。
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+mod pad_layout;
 /// iOS 纯触摸复制/粘贴工具条(原生 UIView 叠层)。
 #[cfg(target_os = "ios")]
 mod ios_textbar;
@@ -202,6 +205,25 @@ const MEM_PRELOAD_TRIM_MB: u64 = 2500;
 // 故关闭源位图逐出实验(它对本游戏无用且每 tick 刷日志);真正的省内存/降热靠上面的 render_scale。
 #[cfg(target_os = "ios")]
 const IOS_EVICT_EXPERIMENT: bool = false;
+
+/// iOS 安全区留白(逻辑点)。winit 在 iOS 上 `outer_size` 是全屏、`inner_size`/`inner_position`
+/// 是安全区,两者相减即四边留白(灵动岛/圆角/底部横条)。拿不到时按 0 处理。
+#[cfg(target_os = "ios")]
+fn safe_insets(window: &Window) -> pad_layout::Insets {
+    let scale = window.scale_factor();
+    let outer = window.outer_size();
+    let inner = window.inner_size();
+    let pos = window.inner_position().unwrap_or_default();
+    let (ox, oy) = (outer.width as f64, outer.height as f64);
+    let (ix, iy) = (pos.x as f64, pos.y as f64);
+    let (iw, ih) = (inner.width as f64, inner.height as f64);
+    pad_layout::Insets {
+        left: (ix / scale).max(0.0),
+        top: (iy / scale).max(0.0),
+        right: ((ox - ix - iw) / scale).max(0.0),
+        bottom: ((oy - iy - ih) / scale).max(0.0),
+    }
+}
 
 /// 喂给 wgpu surface / 引擎 viewport 的渲染尺寸(物理像素 × RENDER_SCALE)。
 /// 注意:**触摸坐标也必须 ×RENDER_SCALE** 才与缩小后的 viewport 一致(见 Touch 处理),
@@ -426,11 +448,13 @@ impl App {
     /// 桌面在 about_to_wait 里 tick 后直接调本方法(同轮直渲,省一次 run-loop 往返延迟);
     /// iOS 仍走 request_redraw → RedrawRequested 调本方法(平台约束:必须在 RedrawRequested 绘制)。
     fn redraw_now(&mut self) {
+        let mut size_changed = false;
         if let Some(w) = &self.window {
             let (width, height) = render_dims(w);
             let scale = w.scale_factor();
             if (width, height) != self.viewport && width > 0 && height > 0 {
                 self.viewport = (width, height);
+                size_changed = true;
                 let inner = w.inner_size();
                 tracing::info!(
                     "viewport 同步 render={}x{} (inner={}x{}) scale={}",
@@ -444,6 +468,9 @@ impl App {
                     })
                 });
             }
+        }
+        if size_changed {
+            self.relayout_overlays();
         }
         #[cfg(not(target_os = "ios"))]
         let _rt = Instant::now();
@@ -463,6 +490,34 @@ impl App {
         }
         self.frames += 1;
     }
+
+    /// 按当前窗口尺寸重新布局 iOS 原生叠层(虚拟手柄、文本工具条)。
+    ///
+    /// 必须在**每次屏幕尺寸变化**时调用:折叠屏合上/展开(iPhone Duo 内外屏切换)、旋转、
+    /// 分屏。之前手柄只在启动时布局一次,尺寸一变按钮和命中区就停在旧屏幕的坐标上。
+    #[cfg(target_os = "ios")]
+    fn relayout_overlays(&mut self) {
+        let Some(w) = self.window.clone() else { return };
+        let scale = w.scale_factor();
+        let (w_px, h_px) = surface_dims(&w);
+        let (sw, sh) = (w_px as f64 / scale, h_px as f64 / scale);
+        let safe = safe_insets(&w);
+        if let Some(gp) = self.gamepad.as_mut() {
+            let mode = gp.layout(sw, sh, scale, safe);
+            tracing::info!(
+                "叠层重排:{sw:.0}x{sh:.0}pt 安全区 左{:.0}右{:.0}下{:.0} → 手柄{mode:?}",
+                safe.left, safe.right, safe.bottom
+            );
+        }
+        if self.kbd_on {
+            if let Some(tb) = self.textbar.as_mut() {
+                tb.layout(sw, scale);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "ios"))]
+    fn relayout_overlays(&mut self) {}
 
     /// 主动回收内存(内存守卫 / 系统内存告警 / 进后台 三条路径共用)。
     ///
@@ -653,16 +708,14 @@ impl ApplicationHandler<UserEvent> for App {
             ruffle_render::evict::set_evict(IOS_EVICT_EXPERIMENT);
             // 屏幕虚拟手柄(方向键+空格+切换钮),初始隐藏面板、切换钮常驻。
             self.gamepad = ios_gamepad::GamePad::new(&window);
-            if let Some(gp) = self.gamepad.as_mut() {
-                let scale = window.scale_factor();
-                let (w_px, h_px) = surface_dims(&window);
-                gp.layout(w_px as f64 / scale, h_px as f64 / scale, scale);
+            if self.gamepad.is_some() {
                 tracing::info!("iOS 虚拟手柄已创建");
             } else {
                 tracing::warn!("iOS 虚拟手柄创建失败");
             }
         }
         self.window = Some(window);
+        self.relayout_overlays();
         self.player = Some(player);
         self.kbd = Some(kbd);
         self.last_tick = Instant::now();
@@ -729,8 +782,16 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Resized(_size) => {
                 // 忽略事件携带的 size(iOS 上可能是安全区/全屏不一致),统一用 render_dims(已降采样)。
+                //
+                // ★只在尺寸真的变了才处理★:winit iOS 在每次 layoutSubviews 都发 Resized,哪怕尺寸没变;
+                //   而调试 HUD 每 0.5s 改一次 UILabel 文字就会触发一次布局 → 每 0.5s 一次假 Resized。
+                //   老代码每次都 set_viewport_dimensions,等于每 0.5s 清空全部纹理池 + 重建交换链 +
+                //   重算舞台矩阵(实测日志"叠层重排"每 0.5s 一条),白白毁掉渲染缓存、造成周期性卡顿。
                 if let Some(w) = &self.window {
                     let (width, height) = render_dims(w);
+                    if (width, height) == self.viewport {
+                        return;
+                    }
                     let scale = w.scale_factor();
                     let inner = w.inner_size();
                     self.viewport = (width, height);
@@ -747,6 +808,7 @@ impl ApplicationHandler<UserEvent> for App {
                     });
                     w.request_redraw();
                 }
+                self.relayout_overlays();
             }
             WindowEvent::RedrawRequested => {
                 // OS 驱动的重绘(窗口暴露/尺寸变化),以及 iOS 的正常出帧路径。
