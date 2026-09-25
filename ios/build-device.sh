@@ -4,7 +4,8 @@
 #   设备 UDID 用 `xcrun devicectl list devices` 查(physical / available 那台)。
 set -e
 cd "$(dirname "$0")/.."
-export PATH="$HOME/.cargo/bin:$PATH"
+# 正式版 Xcode(SDK 26.x)+ SDKROOT + Java,见 ios/_env.sh 头注释(iOS 27 启动即被终止的根因)。
+source ios/_env.sh
 
 DEV="${1:?用法: ios/build-device.sh <设备UDID>}"
 DD=/tmp/mole_dd
@@ -12,6 +13,7 @@ DD=/tmp/mole_dd
 echo "== 1. 编译真机二进制 (aarch64-apple-ios, release) =="
 # release:AVM 解释器 debug 慢一个数量级,真机帧率/流畅度全靠 release(project.yml 注入 release 二进制)
 cargo +stable build --release --target aarch64-apple-ios -p moleruffle-desktop
+check_binary_sdk target/aarch64-apple-ios/release/moleruffle
 
 echo "== 2. 生成 Xcode 工程 =="
 ( cd ios && xcodegen generate )
