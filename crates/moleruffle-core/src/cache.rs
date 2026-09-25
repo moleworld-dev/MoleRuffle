@@ -26,8 +26,34 @@ use ruffle_core::loader::Error;
 use ruffle_core::socket::{SocketAction, SocketHandle};
 use url::{ParseError, Url};
 
+use crate::server;
+
 /// 失败重试次数(总尝试 = RETRIES + 1)。只对幂等 GET 生效。抖动网络下瞬时超时重试一次往往就成。
 const RETRIES: u32 = 2;
+
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+/// 缓存运行时统计(全局):命中数 / 未命中数 / 命中读盘字节 / 写盘字节。
+/// 供各端(如桌面 perf 日志)读取,量化缓存实际加速,避免盲调。
+pub static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
+pub static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
+pub static CACHE_HIT_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static CACHE_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// MoleRuffle:大加载信号(P0 内存事故缓解)。navigator 一看到 .swf 请求(切场景/魔灵等
+/// 小游戏)就置位;壳的内存守卫下个 tick 消费它,抢在资源解码落地前 force_gc+清池腾余量。
+/// 命中磁盘缓存也置位——内存峰值来自解码与注册,与走不走网络无关。
+pub static PENDING_BIG_LOAD_TRIM: AtomicBool = AtomicBool::new(false);
+
+/// (命中, 未命中, 命中读盘字节, 写盘字节)。
+pub fn cache_summary() -> (u64, u64, u64, u64) {
+    (
+        CACHE_HITS.load(Ordering::Relaxed),
+        CACHE_MISSES.load(Ordering::Relaxed),
+        CACHE_HIT_BYTES.load(Ordering::Relaxed),
+        CACHE_WRITE_BYTES.load(Ordering::Relaxed),
+    )
+}
 
 /// 给 `ExternalNavigatorBackend` 套上本地资源缓存 + GET 重试。
 /// 内层包 `Rc<RefCell<N>>`:重试需要在异步过程里重新发起请求,借此绕开 `&self` 的生命周期约束
@@ -57,27 +83,62 @@ impl<N> CachingNavigator<N> {
     }
 }
 
-/// 哪些请求可缓存:GET + 无 body + 静态资源主机 + 无 query/非动态脚本。
-/// 登录/会话(account.61.com、带 ? 的动态、.php 等)一律不缓存,避免拿到陈旧的动态响应。
-fn is_cacheable(req: &Request) -> bool {
-    if req.method() != NavigationMethod::Get || req.body().is_some() {
+/// 不可变媒体资产后缀白名单:只缓存这些确定"版本内不变"的静态资源。
+/// 动态脚本(.php/.jsp)、配置/文本(.xml/.txt 可能无版本号却会变)一律不在白名单 → 不缓存。
+const STATIC_EXT: &[&str] = &[
+    ".swf", ".jpg", ".jpeg", ".png", ".gif", ".mp3", ".wav", ".bin", ".dat", ".fla", ".ttf",
+];
+
+/// 哪些请求可缓存。★入参必须是【已解析的绝对 URL】★,见 [`CachingNavigator::fetch`] 的说明。
+///
+/// 判定三条:
+/// 1. host **精确等于**当前服务器的 host(不是子串匹配 —— 旧代码 `url.contains("mole.61.com")`
+///    既漏掉平行服 `mole.61player.com`,又会把 `evil.example/x.swf?ref=mole.61.com` 误判为可缓存);
+/// 2. 路径后缀属媒体白名单(**不因含 `?` 就拒**:Flash 惯例给静态资源加 `?v=` 版本串,
+///    按"去 query 后的路径后缀"判,而缓存 key 用**完整绝对 URL(含 query)** 的 hash
+///    → 版本号一变即换 key、自动 cache-bust,绝不拿陈旧);
+/// 3. **root `Client.swf` 显式拉黑** —— 它是版本闸的另一半(见 server.rs 头注释):
+///    SWF 内嵌的 VERSION 必须与服务端 `version/zzz_config.txt` 清单匹配。缓存它 = 服务端一更新
+///    客户端,本地还拿旧 SWF → 旧 VERSION vs 新清单 → 永久卡在"请稍候",且无 TTL 自愈不了
+///    (iOS 玩家连删缓存目录都做不到)。官方服四年没动 SWF 才没暴露,平行服在活跃迭代必然踩。
+///    代价仅是每次启动多下 ~20KB。
+fn is_cacheable(abs: &Url, has_body: bool) -> bool {
+    if has_body {
         return false;
     }
-    let url = req.url();
-    url.contains("mole.61.com")
-        && !url.contains('?')
-        && !url.contains(".php")
-        && !url.contains(".jsp")
+    if abs.host_str() != Some(server::selected().host) {
+        return false;
+    }
+    let path = abs.path().to_ascii_lowercase();
+    if path.eq_ignore_ascii_case("/client.swf") {
+        return false; // ★ root 版本闸,必须每次拿最新
+    }
+    STATIC_EXT.iter().any(|ext| path.ends_with(ext))
+}
+
+/// 确定性失败(4xx):重试毫无意义,只会把一次 404 放大成 3 次请求 + 3 倍延迟。
+/// 5xx / 网络抖动 / 超时才值得重试(摩尔服务器抖起来确实靠重试救回)。
+fn is_worth_retry(err: &ErrorResponse) -> bool {
+    !matches!(err.error, Error::HttpNotOk(_, status, ..) if (400..500).contains(&status))
 }
 
 fn write_cache_atomic(path: &PathBuf, bytes: &[u8]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    // 写临时文件再 rename,保证不会出现半截的损坏缓存
-    let tmp = path.with_extension("tmp");
+    // 写临时文件再 rename,保证不会出现半截的损坏缓存。
+    // ★tmp 名必须唯一★:老代码用固定的 `path.with_extension("tmp")`,同一 URL 并发写会互相
+    // 踩踏(两个写入交错 → rename 出半截文件)。加进程内递增序号隔离。
+    // 残留的 .tmp(写到一半被 jetsam/断电打断)由 trim_cache_in_background 启动时收走。
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_extension(format!("tmp{seq}"));
     if std::fs::write(&tmp, bytes).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
+        if std::fs::rename(&tmp, path).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+    } else {
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -89,12 +150,40 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
         }
 
         let url = request.url().to_string();
-        let cacheable = is_cacheable(&request);
-        let cache_path = cacheable.then(|| self.cache_path(&url));
+        // 子 SWF 请求 = 即将有大加载(新场景/小游戏:库位图+cacheAsBitmap+movie_library 一起来,
+        // 全是清池碰不到的项)→ 通知守卫先催收腾余量。(按后缀判,相对/绝对 URL 都成立。)
+        if url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .ends_with(".swf")
+        {
+            PENDING_BIG_LOAD_TRIM.store(true, Ordering::Relaxed);
+        }
+
+        // ★★ 缓存失效根治(2026-07-26)★★
+        // 老代码直接拿 `request.url()` 判 host,但**这里收到的是 SWF 里原样写的相对路径**
+        // (`resource/login/LoginHome.swf`、`module/external/logo/randomMC.swf` …):
+        // `Player::fetch` 把 Request 原样交给 navigator 不做解析,真正的 `resolve_url` 发生在
+        // **内层** ExternalNavigatorBackend::fetch —— 也就是本缓存层的【下游】。
+        // 相对路径不含 host → 老的 host 判定全 false → **几百个资源一个都没进缓存**,只有壳层
+        // 直接喂绝对 URL 的 root Client.swf 漏了进去(实测本机缓存目录当时只有 1 个文件)。
+        // 而 CACHE_HITS/MISSES 只在 cache_path.is_some() 时计数 → 统计恒为 0,完美掩盖了根因。
+        // 修法:先借内层的 resolve_url 解析成绝对 URL(它内部还会走 pre_process_url,与真实抓取
+        // URL 一致),再判定 + 用绝对 URL 做 hash key(不同服天然不撞 key)。
+        // 借用只在这一行同步调用期间持有,不跨 await。
+        let abs = self.inner.borrow().resolve_url(&url).ok();
+        let cache_path = abs
+            .as_ref()
+            .filter(|u| is_cacheable(u, request.body().is_some()))
+            .map(|u| self.cache_path(u.as_str()));
 
         // 缓存命中:直接读盘返回(免网络,秒开)
         if let Some(path) = &cache_path {
             if let Ok(bytes) = std::fs::read(path) {
+                CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                CACHE_HIT_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 tracing::debug!("缓存命中: {url}");
                 let u = url.clone();
                 return Box::pin(async move {
@@ -104,6 +193,9 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
         }
 
         // 未命中:走网络。GET 幂等,失败/超时重试 RETRIES 次;成功且可缓存(200)则存盘。
+        if cache_path.is_some() {
+            CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+        }
         let inner = self.inner.clone();
         let headers = request.headers().clone();
         Box::pin(async move {
@@ -126,6 +218,7 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
                         match resp.body().await {
                             Ok(bytes) => {
                                 write_cache_atomic(path, &bytes);
+                                CACHE_WRITE_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
                                 tracing::debug!("缓存写入: {url} ({} 字节)", bytes.len());
                                 return Ok(Box::new(CachedResponse::new(final_url, bytes))
                                     as Box<dyn SuccessResponse>);
@@ -141,7 +234,8 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
                         }
                     }
                     Err(err) => {
-                        if attempt < RETRIES {
+                        // 4xx 是确定性失败(资源真不存在),重试只是把一次 404 放大成 3 次请求。
+                        if attempt < RETRIES && is_worth_retry(&err) {
                             attempt += 1;
                             tracing::debug!("拉取失败,重试 {attempt}/{RETRIES}: {url}");
                             continue;
@@ -245,11 +339,111 @@ impl SuccessResponse for CachedResponse {
     }
 }
 
-/// 资源缓存目录:各端缓存目录下 MoleRuffle/http(iOS=沙盒 Library/Caches/MoleRuffle/http)。
-pub fn cache_dir() -> PathBuf {
+/// 资源缓存根目录:各端缓存目录下 `MoleRuffle/http`(iOS=沙盒 `Library/Caches/MoleRuffle/http`,
+/// 可被系统按需清理,正合缓存语义)。
+pub fn cache_root() -> PathBuf {
     dirs::cache_dir()
         .or_else(dirs::data_local_dir)
         .unwrap_or_else(|| PathBuf::from("."))
         .join("MoleRuffle")
         .join("http")
+}
+
+/// 当前服务器的资源缓存目录(`<root>/<服务器id>`)。
+///
+/// 按服分目录而不是共用一个目录:虽然 key 是完整绝对 URL 的 hash、两服天然不撞,但分目录让
+/// "只清某个服的缓存"成为可能,也避免统计/容量预算互相干扰。
+pub fn cache_dir() -> PathBuf {
+    cache_root().join(server::selected().id)
+}
+
+/// 缓存容量预算(字节)。超出后由 [`trim_cache_in_background`] 按最近访问时间从老到新删。
+/// 默认 1.5GB;`MOLE_CACHE_BUDGET_MB` 可覆盖,设 0 = 不限(旧行为)。
+fn cache_budget_bytes() -> u64 {
+    const DEFAULT_MB: u64 = 1536;
+    std::env::var("MOLE_CACHE_BUDGET_MB")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_MB)
+        * 1024
+        * 1024
+}
+
+/// 后台修剪缓存目录:清理 `.tmp` 孤儿 + 超预算时按 mtime 从老到新删,直到降到预算的 80%。
+///
+/// 为什么需要:老实现**零上限、零 LRU、零 TTL、零清理入口**,只增不减。一局游戏几百个资源 SWF,
+/// 长期玩会持续占用玩家磁盘(iOS 上玩家能在「储存空间」里看到这个数字,且自己删不掉)。
+/// 另外 `write_cache_atomic` 若在 write 与 rename 之间被 jetsam/断电打断,会留下永不清理的
+/// `.tmp` 孤儿,这里一并收掉。
+///
+/// 跑在独立线程:遍历+stat 是阻塞 IO,绝不能放在事件循环线程上(那会卡帧)。
+/// 启动时调一次即可 —— 缓存增长是"每局几百个文件"的量级,不需要实时监控。
+pub fn trim_cache_in_background() {
+    let dir = cache_dir();
+    let budget = cache_budget_bytes();
+    std::thread::Builder::new()
+        .name("mole-cache-trim".into())
+        .spawn(move || {
+            let mut entries: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
+            let mut total: u64 = 0;
+            let mut orphans = 0usize;
+            // 两层结构:<dir>/<hash前2位>/<hash>.swfcache
+            let Ok(buckets) = std::fs::read_dir(&dir) else { return };
+            for bucket in buckets.flatten() {
+                let Ok(files) = std::fs::read_dir(bucket.path()) else { continue };
+                for f in files.flatten() {
+                    let path = f.path();
+                    let Ok(md) = f.metadata() else { continue };
+                    if !md.is_file() {
+                        continue;
+                    }
+                    // .tmpN 孤儿:上次写盘被中断的残留(名字带进程内序号,见 write_cache_atomic),直接删
+                    if path
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.starts_with("tmp"))
+                    {
+                        let _ = std::fs::remove_file(&path);
+                        orphans += 1;
+                        continue;
+                    }
+                    let mtime = md.modified().unwrap_or(std::time::UNIX_EPOCH);
+                    total += md.len();
+                    entries.push((path, md.len(), mtime));
+                }
+            }
+            if orphans > 0 {
+                tracing::info!("缓存清理: 删除 {orphans} 个 .tmp 孤儿");
+            }
+            if budget == 0 || total <= budget {
+                tracing::info!(
+                    "缓存 {} 个文件 / {}MB(预算 {}MB,无需修剪)",
+                    entries.len(),
+                    total / (1024 * 1024),
+                    budget / (1024 * 1024)
+                );
+                return;
+            }
+            // 超预算:按 mtime 从老到新删到预算的 80%(留出余量,避免每次启动都紧贴阈值狂删)
+            let target = budget / 10 * 8;
+            entries.sort_by_key(|(_, _, mtime)| *mtime);
+            let mut freed = 0u64;
+            let mut removed = 0usize;
+            for (path, size, _) in &entries {
+                if total - freed <= target {
+                    break;
+                }
+                if std::fs::remove_file(path).is_ok() {
+                    freed += size;
+                    removed += 1;
+                }
+            }
+            tracing::info!(
+                "缓存修剪: {}MB → {}MB(删 {removed} 个最旧文件,预算 {}MB)",
+                total / (1024 * 1024),
+                (total - freed) / (1024 * 1024),
+                budget / (1024 * 1024)
+            );
+        })
+        .ok();
 }

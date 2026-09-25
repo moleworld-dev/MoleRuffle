@@ -27,35 +27,23 @@ use unic_langid::LanguageIdentifier;
 use url::Url;
 
 pub mod cache;
-pub use cache::{cache_dir, CachingNavigator};
+pub use cache::{cache_dir, CachingNavigator, PENDING_BIG_LOAD_TRIM};
 pub mod mem;
-
-/// 摩尔庄园网页版的引导 SWF(外壳 / 加载器,AS3+Flex4)。
-/// 相对路径(version/、resource/、config/、dll/)都相对它来解析。
-pub const GAME_SWF_URL: &str = "http://mole.61.com/Client.swf";
-
-/// 所有相对 fetch 的 base，回源到 mole.61.com。
-pub const GAME_BASE_URL: &str = "http://mole.61.com/";
-
-/// 窗口标题。
-pub const WINDOW_TITLE: &str = "摩尔庄园 · MoleRuffle";
+pub mod server;
+pub use server::{base_url as game_base_url, swf_url as game_swf_url, ServerConfig};
 
 /// 固定舞台尺寸(Client.swf 的逻辑尺寸)。
 pub const STAGE_WIDTH: u32 = 960;
 pub const STAGE_HEIGHT: u32 = 560;
 
-/// 注意:`Client.swf` 脱离正规宿主会执行 `navigateToURL("http://mole.61.com")`
-/// 把自己弹回首页(实测在裸浏览器里就是这样被弹走的)。
-/// 解法 = 把 SWF 的“自我认知 URL”伪装成它在官网上的地址,域名守卫就放行。
-/// 这正是 [`apply_mole_settings`] 里 `with_spoofed_url` / `with_page_url` 做的事。
-pub const SPOOF_URL: &str = GAME_SWF_URL;
-
-pub fn game_swf_url() -> Url {
-    Url::parse(GAME_SWF_URL).expect("GAME_SWF_URL 必须是合法 URL")
-}
-
-pub fn game_base_url() -> Url {
-    Url::parse(GAME_BASE_URL).expect("GAME_BASE_URL 必须是合法 URL")
+/// 窗口标题。非官方服会带上服务器名,避免玩家分不清自己连的是哪个服。
+pub fn window_title() -> String {
+    let s = server::selected();
+    if s.id == server::OFFICIAL.id {
+        "摩尔庄园 · MoleRuffle".to_string()
+    } else {
+        format!("摩尔庄园 · MoleRuffle（{}）", s.name)
+    }
 }
 
 /// 把一个全新的 `PlayerBuilder` 配成“摩尔庄园专用”。
@@ -101,9 +89,13 @@ pub fn apply_mole_settings(builder: PlayerBuilder) -> PlayerBuilder {
         .with_scale_mode(StageScaleMode::ShowAll, true)
         // 边下边跑:数百个资源 SWF 是运行时陆续拉的
         .with_load_behavior(LoadBehavior::Streaming)
-        // ★ 域名守卫 spoof:让 Client.swf 以为自己就在官网上,不要 navigateToURL 弹走
-        .with_spoofed_url(Some(SPOOF_URL.to_string()))
-        .with_page_url(Some(SPOOF_URL.to_string()))
+        // ★ 宿主伪装 spoof:让 Client.swf 以为自己就在官网上(playerType/ExternalInterface 判定),
+        //   不要 navigateToURL 弹走。★必须跟着当前服务器变★——spoof 决定引擎眼里 root movie 的
+        //   URL,而 SharedObject(.sol)落盘路径是 {movie_host}/{local_path}/{name}.sol,spoof 不
+        //   跟着换 = 官方服与平行服的存档写进同一棵目录互相覆盖(登录框看到别服的米米号,静默污染)。
+        //   跟着换则分服是引擎白送的,mole_storage_dir() 不用动。详见 server.rs 头注释。
+        .with_spoofed_url(Some(server::selected().spoof_url.to_string()))
+        .with_page_url(Some(server::selected().spoof_url.to_string()))
         // 伪装成较新的 Flash Player 版本(摩尔庄园按 plugin 版本判断兼容)
         .with_player_version(Some(32))
         // 实验开关:MOLE_FPS=60 强制覆盖 SWF 的 24fps(用来测摩尔庄园是"帧基"还是"时间基")。
