@@ -21,7 +21,9 @@ authors = ["moleworld-dev"]
 ruffle_core = { git = "https://github.com/ruffle-rs/ruffle", rev = "304a3c9dcaf42ed6d4b1c8bbd05f10d21f407c2e", features = ["audio", "mp3", "aac", "nellymoser", "default_compatibility_rules"] }
 ruffle_render = { git = "https://github.com/ruffle-rs/ruffle", rev = "304a3c9dcaf42ed6d4b1c8bbd05f10d21f407c2e" }
 ruffle_render_wgpu = { git = "https://github.com/ruffle-rs/ruffle", rev = "304a3c9dcaf42ed6d4b1c8bbd05f10d21f407c2e" }
-ruffle_frontend_utils = { git = "https://github.com/ruffle-rs/ruffle", rev = "304a3c9dcaf42ed6d4b1c8bbd05f10d21f407c2e", features = ["cpal", "navigator"] }
+# default-features=false 去掉默认 native-tls(会拉 openssl,安卓交叉编不了);TLS 后端改由
+# desktop/Cargo.toml 分平台给(非安卓 native-tls 走系统 Security.framework,安卓 rustls 纯 Rust)。
+ruffle_frontend_utils = { git = "https://github.com/ruffle-rs/ruffle", rev = "304a3c9dcaf42ed6d4b1c8bbd05f10d21f407c2e", default-features = false, features = ["cpal", "navigator"] }
 
 # ── 与 Ruffle 完全对齐的版本(否则 wgpu surface 类型对不上)──
 url = "2.5.8"

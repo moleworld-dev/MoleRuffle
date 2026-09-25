@@ -406,7 +406,12 @@ impl App {
                 scale_factor: window.scale_factor(),
             });
             mole::set_mole_fonts(&mut p);
-            p.fetch_root_movie(mole::GAME_SWF_URL.to_string(), vec![], Box::new(|_| {}));
+            // root SWF 用当前服务器的地址(与 navigator base / spoof 同源,见 core 的 server.rs)。
+            p.fetch_root_movie(
+                mole::server::selected().swf_url.to_string(),
+                vec![],
+                Box::new(|_| {}),
+            );
         }
         (player, kbd, render_api)
     }
@@ -459,6 +464,39 @@ impl App {
         self.frames += 1;
     }
 
+    /// 主动回收内存(内存守卫 / 系统内存告警 / 进后台 三条路径共用)。
+    ///
+    /// 三步缺一不可:
+    /// ① `force_gc` 两轮完整 GC —— 死场景的解码位图、子 SWF 库(`Arc<SwfMovie>`→movie_library)、
+    ///    位图句柄/网格全靠 GC 收走才释放;gc-arena 默认起搏"看不见"这些外部字节,几乎不主动收,
+    ///    这正是"越玩越大"的主因。
+    /// ② 清纹理池 —— `set_viewport_dimensions`(同尺寸)会重建 `TexturePool`,放掉跨帧累积的离屏
+    ///    纹理(实测量级 ~1GB)。这是目前唯一的清池入口。
+    /// ③ `relieve_malloc_pressure` —— ①②只是 `free()`,页仍留在 libmalloc free list 里,**照样计入
+    ///    `phys_footprint`(jetsam 的判杀口径)**。不做这一步会出现"回收了几百 MB 但足迹不降"、
+    ///    守卫看着没用也真救不回余量。
+    fn reclaim_memory(&mut self, reason: &str) {
+        let Some(w) = self.window.clone() else { return };
+        let before = mole::mem::footprint_mb().unwrap_or(0);
+        let (width, height) = render_dims(&w);
+        let scale_factor = w.scale_factor();
+        self.with_player(|p| {
+            p.force_gc();
+            p.set_viewport_dimensions(ViewportDimensions {
+                width,
+                height,
+                scale_factor,
+            });
+        });
+        let released_mb = mole::mem::relieve_malloc_pressure() / (1024 * 1024);
+        self.last_pool_trim = Instant::now();
+        let after = mole::mem::footprint_mb().unwrap_or(0);
+        tracing::warn!(
+            "[内存回收/{reason}] 足迹 {before}→{after}MB(Δ{}MB,malloc 归还 {released_mb}MB)",
+            before as i64 - after as i64
+        );
+    }
+
     /// iOS 内存观测 + 自适应守卫 + 刷新调试 HUD(时间驱动,在 about_to_wait 每 ~0.5s 调一次)。
     /// `since` = 距上次调用的间隔,用于算实时 FPS(渲染帧数差 / 间隔)。
     /// 守卫:余量跌破 SOFT/URGENT 阈值就主动重置纹理池(set_viewport 同尺寸 → TexturePool::new()
@@ -506,39 +544,44 @@ impl App {
         //   起搏看不见位图字节几乎不收——这正是"越玩越大"的主因)②再重置纹理池。
         // 大加载预清:navigator 一见 .swf 请求(切场景/魔灵小游戏)就置位 PENDING_BIG_LOAD_TRIM,
         //   这里抢在资源解码落地前先催收腾余量,防"高水位 + 加载尖峰"瞬间越过 Jetsam 墙。
-        let big_load = mole::PENDING_BIG_LOAD_TRIM.swap(false, Relaxed);
-        if avail > 0 {
-            let urgent = avail < MEM_URGENT_MB;
-            let min_gap = if urgent { 2 } else { 6 };
-            let low = avail < MEM_SOFT_FLOOR_MB
-                && self.last_pool_trim.elapsed().as_secs() >= min_gap;
-            let preload = big_load
-                && avail < MEM_PRELOAD_TRIM_MB
-                && self.last_pool_trim.elapsed().as_secs() >= 3;
-            if low || preload {
-                if let Some(w) = self.window.clone() {
-                    let (width, height) = render_dims(&w);
-                    let scale_factor = w.scale_factor();
-                    self.with_player(|p| {
-                        // ① 两轮完整 GC:释放死场景的解码位图/子SWF库/句柄(帧边界,安全)。
-                        p.force_gc();
-                        // ② 清纹理池(离屏池跨帧累积 + GC 刚放掉的池纹理)。
-                        p.set_viewport_dimensions(ViewportDimensions {
-                            width,
-                            height,
-                            scale_factor,
-                        });
-                    });
-                    self.last_pool_trim = Instant::now();
-                    let after = mole::mem::footprint_mb().unwrap_or(0);
-                    tracing::warn!(
-                        "内存守卫{}{}:余量 {avail}MB 足迹 {foot}→{after}MB(GC+清池,Δ{}MB)",
-                        if urgent { "(急)" } else { "" },
-                        if preload && !low { "(大加载预清)" } else { "" },
-                        foot as i64 - after as i64
-                    );
-                }
+        // ★标志不能无条件消费★:老代码 swap(false) 后若被 3s 节流拦下,这次大加载信号就【永久丢失】,
+        //   等于该场景切换完全没做预清。改为"决定要用才消费,被节流则留给下一 tick"。
+        let big_load = mole::PENDING_BIG_LOAD_TRIM.load(Relaxed);
+        let gap = self.last_pool_trim.elapsed().as_secs();
+
+        // ★avail 兜底★:os_proc_available_memory 返回 0(不可用/不支持)时,老代码 `if avail > 0`
+        //   会让整个守卫【静默停摆】——最需要保护的老设备/异常环境反而完全没保护。
+        //   这里退化成按足迹绝对值判断(墙最低的机型 ~3.4GB,留足安全边际)。
+        const FOOT_HIGH_MB: u64 = 2200; // 无余量信息时的高水位
+        let (urgent, low_water, preload_water) = if avail > 0 {
+            (
+                avail < MEM_URGENT_MB,
+                avail < MEM_SOFT_FLOOR_MB,
+                avail < MEM_PRELOAD_TRIM_MB,
+            )
+        } else {
+            (
+                foot > FOOT_HIGH_MB + 600,
+                foot > FOOT_HIGH_MB,
+                foot > FOOT_HIGH_MB.saturating_sub(600),
+            )
+        };
+
+        let min_gap = if urgent { 2 } else { 6 };
+        let low = low_water && gap >= min_gap;
+        let preload = big_load && preload_water && gap >= 3;
+        if low || preload {
+            if preload {
+                mole::PENDING_BIG_LOAD_TRIM.store(false, Relaxed); // 真正用掉才清
             }
+            let reason = if urgent {
+                "急"
+            } else if preload && !low {
+                "大加载预清"
+            } else {
+                "水位"
+            };
+            self.reclaim_memory(&format!("{reason}/余量{avail}MB"));
         }
 
         // Phase 2-A 实验:逐出库位图,从 console 内存曲线判断"清句柄"是否真省内存。
@@ -568,7 +611,7 @@ impl ApplicationHandler<UserEvent> for App {
         //   (winit ios window.rs:510),设成 960x560 会让 view 不铺满全屏 → winit 上报的 viewport
         //   偏小且与真实屏幕/drawable 不一致 → Ruffle 的 ShowAll 基于错误视口计算 → 画面溢出、
         //   左右被裁、按钮点不到(实测现象)。iOS 不设 inner_size,让 winit 用全屏 screen_bounds。
-        let attrs = Window::default_attributes().with_title(mole::WINDOW_TITLE);
+        let attrs = Window::default_attributes().with_title(mole::window_title());
         #[cfg(not(target_os = "ios"))]
         let attrs = attrs.with_inner_size(LogicalSize::new(mole::STAGE_WIDTH, mole::STAGE_HEIGHT));
         // ★ iOS 强制横屏:摩尔庄园是 960x560 横屏游戏,但 winit 默认 valid_orientations =
@@ -636,11 +679,48 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         // 异步任务(如 SWF 加载完成)后引导/维持 redraw 循环。
-        // iOS 上 resumed 里的首次 request_redraw 可能在窗口就绪前丢失,
-        // 这里在 SWF/资源加载事件后再请求,确保渲染循环被启动。
+        //
+        // ★加脏标门(2026-07-26)★:老代码在这里【无条件】request_redraw,而 RedrawRequested →
+        // redraw_now() → p.render() 这条路上**没有任何脏标检查**(ruffle 的 `Player::render` 开头
+        // 也不早退),于是每次异步唤醒都渲一整帧。
+        // 代价集中在加载窗口:HTTP body 由 hyper 按 16-64KB 分片,每片唤醒一次执行器,
+        // 单个资源 SWF(均值 ~456KB)= 7-30 轮唤醒;一次切场景 ~40 个资源 → 400-600 次额外全帧渲染
+        // (桌面 1-4ms/帧、iOS 3-8ms/帧)= 白烧 0.4-4.8 秒主线程 + 同样多次 GPU 提交。
+        // 这正是"切场景卡 + 发热"的一个机制性来源。
+        //
+        // 加门后完全不会漏帧:about_to_wait 在同一轮事件批之后必定执行,桌面在那里同轮直渲、
+        // iOS 在那里按 needs_render 请求重绘。`frames == 0` 兜住 iOS 首帧引导(见下方原注释的顾虑)。
         if let Some(w) = &self.window {
-            w.request_redraw();
+            let dirty = self.with_player(|p| p.needs_render()).unwrap_or(false);
+            if dirty || self.frames == 0 {
+                w.request_redraw();
+            }
         }
+    }
+
+    /// ★系统内存告警(iOS/Android)★
+    ///
+    /// winit 早就在收 `UIApplicationDidReceiveMemoryWarningNotification` 并派发
+    /// `Event::MemoryWarning`(见 winit `platform_impl/ios/event_loop.rs`),但 `ApplicationHandler`
+    /// 的默认实现是**空 no-op** —— 我们没实现它,等于这个信号一直被丢掉、0 次执行。
+    ///
+    /// 而本项目 JetsamEvent 实测死因正是 `per-process-limit`,iOS 在动手杀之前**必定先发这个告警**。
+    /// 这是系统白送的、与我们主要死法直接对口的救命预警,接上成本极低。
+    fn memory_warning(&mut self, _el: &ActiveEventLoop) {
+        enter_runtime!(self);
+        // 先判窗口存在:iOS 在真后台也可能投递告警,此时 set_viewport_dimensions 会去建 Metal 资源
+        // (分配允许、提交命令不允许),reclaim_memory 内部已用 `let Some(w) = ...else return` 兜住。
+        self.reclaim_memory("系统内存告警");
+    }
+
+    /// 进后台 / 失焦:主动交还内存。
+    ///
+    /// iOS 挑内存大户下手,后台驻留期间足迹越低越不容易被杀;而玩家切回来时本来就要重建画面,
+    /// 此刻清池几乎无感(不像游戏中清池会有一帧停顿)。桌面最小化同理,顺带把长期占用降下来。
+    fn suspended(&mut self, _el: &ActiveEventLoop) {
+        enter_runtime!(self);
+        tracing::info!("进入后台,主动回收内存");
+        self.reclaim_memory("进后台");
     }
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -956,6 +1036,21 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
 
+        // 桌面 / 安卓的回收路径:iOS 靠 `os_proc_available_memory` 的余量驱动守卫,但那套是
+        // `#[cfg(target_os = "ios")]` 圈死的 —— 桌面与安卓于是**一条回收路径都没有**,而纹理池
+        // 同样只进不出(fork 默认跨帧复用 + 池无淘汰),长期玩必然持续上涨。
+        // 这里用保守触发:只在【切场景】(navigator 报告有 .swf 请求)且距上次回收 ≥60s 时做一次。
+        // 切场景本就有加载停顿,此刻 GC+清池无感;稳态游戏中绝不打扰,不会引入卡顿。
+        #[cfg(not(target_os = "ios"))]
+        {
+            if mole::PENDING_BIG_LOAD_TRIM.load(Ordering::Relaxed)
+                && self.last_pool_trim.elapsed().as_secs() >= 60
+            {
+                mole::PENDING_BIG_LOAD_TRIM.store(false, Ordering::Relaxed);
+                self.reclaim_memory("切场景");
+            }
+        }
+
         // 桌面性能基线打点(Phase 3):每 ~2s 打印一次
         //   FPS(实渲染帧/秒,锁帧下反映游戏活跃度)| render() CPU 耗时(构建+提交命令,不含 GPU 异步)
         //   | 离屏 churn(池复用后应≈0,create_empty 速率)| 常驻库位图。
@@ -1006,6 +1101,27 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
+/// 显式给离屏纹理池设容量预算(MoleRuffle 侧的选择,不改 ruffle-fork 默认值)。
+///
+/// fork 里预算默认 0 = 不修剪(与上游字节级一致,共用本 fork 的其它项目不受影响);
+/// MoleRuffle 这里显式开启,让跨帧复用的池不再无界累积:
+/// 池按 (尺寸,usage,format,采样数) 精确建 key 且永不淘汰,滤镜/cacheAsBitmap 按对象包围盒开尺寸
+/// → 玩久了尺寸组合无界增长,实测可累积 ~1GB,而唯一回收点只有 set_viewport_dimensions。
+///
+/// 取值:移动端 288MB(全屏离屏 ~9.7MB/张 @2294×1056,约容 30 张,足够一帧的滤镜/遮罩链复用),
+/// 桌面 512MB(窗口小、离屏更小,给宽松些)。`MOLE_POOL_BUDGET_MB` 可覆盖,设 0 退回不修剪。
+fn apply_pool_budget() {
+    if std::env::var("MOLE_POOL_BUDGET_MB").is_ok() {
+        return; // env 已在 init_from_env 里生效,尊重显式覆盖
+    }
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    const BUDGET_MB: u64 = 288;
+    #[cfg(not(any(target_os = "ios", target_os = "android")))]
+    const BUDGET_MB: u64 = 512;
+    ruffle_render::evict::set_offscreen_pool_budget_mb(BUDGET_MB);
+    tracing::info!("离屏纹理池预算 {BUDGET_MB}MB(超出按最久未用逐出)");
+}
+
 /// 事件循环装配 + 运行主体(桌面 / iOS / 安卓三端共用)。
 /// event_loop 由各平台入口按平台方式构造后传入(安卓要 with_android_app)。
 pub fn run(event_loop: EventLoop<UserEvent>) -> anyhow::Result<()> {
@@ -1028,8 +1144,12 @@ pub fn desktop_main() -> anyhow::Result<()> {
 
     // 纹理逐出开关:读 MOLE_TEXTURE_EVICT(Phase 1 不设=保持关=行为同现状)。
     ruffle_render::evict::init_from_env();
+    apply_pool_budget();
 
-    tracing::info!("MoleRuffle 启动,加载 {}", mole::GAME_SWF_URL);
+    let srv = mole::server::selected();
+    tracing::info!("MoleRuffle 启动 | 服务器 {} | 加载 {}", srv.name, srv.swf_url);
+    // 缓存维护(独立线程,不卡事件循环):清 .tmp 孤儿 + 超预算时按最旧删。
+    mole::cache::trim_cache_in_background();
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     run(event_loop)
@@ -1057,7 +1177,10 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
         .try_init();
 
     ruffle_render::evict::init_from_env();
-    tracing::info!("MoleRuffle 安卓启动,加载 {}", mole::GAME_SWF_URL);
+    apply_pool_budget();
+    let srv = mole::server::selected();
+    tracing::info!("MoleRuffle 安卓启动 | 服务器 {} | 加载 {}", srv.name, srv.swf_url);
+    mole::cache::trim_cache_in_background();
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .with_android_app(app)
