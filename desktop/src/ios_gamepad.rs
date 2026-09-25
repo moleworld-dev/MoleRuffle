@@ -12,6 +12,14 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
 
 use crate::keymap::GamepadKey;
+use crate::pad_layout;
+
+fn to_cg(r: pad_layout::Rect) -> CGRect {
+    CGRect {
+        origin: CGPoint { x: r.x, y: r.y },
+        size: CGSize { width: r.w, height: r.h },
+    }
+}
 
 /// 命中结果:方向/空格键,或切换钮。
 #[derive(Clone, Copy, PartialEq)]
@@ -19,15 +27,6 @@ pub enum GamepadHit {
     Key(GamepadKey),
     Toggle,
 }
-
-// 布局常量(逻辑点)。
-const BTN: f64 = 64.0; // 方向键单格边长
-const EDGE: f64 = 30.0; // 距屏幕边距
-const SP_W: f64 = 150.0; // 空格键宽
-const SP_H: f64 = 64.0; // 空格键高
-const TG_W: f64 = 56.0; // 切换钮宽
-const TG_H: f64 = 44.0; // 切换钮高
-const GAP: f64 = 12.0;
 
 /// 一个按钮的标签 + 其命中目标。
 struct Btn {
@@ -111,56 +110,39 @@ impl GamePad {
         })
     }
 
-    /// 按屏幕逻辑尺寸布局,算出各按钮 frame(逻辑点)与命中矩形(物理像素)。
-    pub fn layout(&mut self, screen_w: f64, screen_h: f64, scale: f64) {
-        // 方向键十字(左下,3×3 网格,中心空)。
-        let gx = EDGE;
-        let gy = screen_h - EDGE - 3.0 * BTN;
-        let dpad = |hit: GamepadHit| -> (f64, f64) {
-            match hit {
-                GamepadHit::Key(GamepadKey::Up) => (gx + BTN, gy),
-                GamepadHit::Key(GamepadKey::Left) => (gx, gy + BTN),
-                GamepadHit::Key(GamepadKey::Right) => (gx + 2.0 * BTN, gy + BTN),
-                GamepadHit::Key(GamepadKey::Down) => (gx + BTN, gy + 2.0 * BTN),
-                _ => (0.0, 0.0),
-            }
-        };
-        // 切换钮(右下角,常驻)。
-        let tg_x = screen_w - EDGE - TG_W;
-        let tg_y = screen_h - EDGE - TG_H;
-        // 空格(切换钮左侧)。
-        let sp_x = tg_x - GAP - SP_W;
-        let sp_y = screen_h - EDGE - SP_H;
-
+    /// 按屏幕逻辑尺寸 + 安全区布局,算出各按钮 frame(逻辑点)与命中矩形(物理像素)。
+    ///
+    /// 位置由 [`crate::pad_layout::compute`] 决定:折叠屏展开 / iPad 放进底栏、超宽屏放进
+    /// 左右黑边、普通手机保持旧的角落叠放。**每次屏幕尺寸变化都要重新调用**(折叠/展开、
+    /// 旋转),否则按钮和命中区会停在旧屏幕的坐标上。返回选中的模式,便于记日志。
+    pub fn layout(
+        &mut self,
+        screen_w: f64,
+        screen_h: f64,
+        scale: f64,
+        safe: pad_layout::Insets,
+    ) -> pad_layout::Mode {
+        let l = pad_layout::compute(screen_w, screen_h, safe);
         self.pad_rects.clear();
         for btn in &self.pad_btns {
-            let (x, y, w, h) = if btn.hit == GamepadHit::Key(GamepadKey::Space) {
-                (sp_x, sp_y, SP_W, SP_H)
-            } else {
-                let (x, y) = dpad(btn.hit);
-                (x, y, BTN, BTN)
+            let r = match btn.hit {
+                GamepadHit::Key(GamepadKey::Up) => l.up,
+                GamepadHit::Key(GamepadKey::Down) => l.down,
+                GamepadHit::Key(GamepadKey::Left) => l.left,
+                GamepadHit::Key(GamepadKey::Right) => l.right,
+                _ => l.space,
             };
-            btn.label.setFrame(CGRect {
-                origin: CGPoint { x, y },
-                size: CGSize { width: w, height: h },
-            });
-            self.pad_rects
-                .push((btn.hit, x * scale, y * scale, (x + w) * scale, (y + h) * scale));
+            btn.label.setFrame(to_cg(r));
+            self.pad_rects.push((btn.hit, r.x * scale, r.y * scale, r.right() * scale, r.bottom() * scale));
         }
-
-        self._toggle.setFrame(CGRect {
-            origin: CGPoint { x: tg_x, y: tg_y },
-            size: CGSize {
-                width: TG_W,
-                height: TG_H,
-            },
-        });
+        self._toggle.setFrame(to_cg(l.toggle));
         self.toggle_rect = (
-            tg_x * scale,
-            tg_y * scale,
-            (tg_x + TG_W) * scale,
-            (tg_y + TG_H) * scale,
+            l.toggle.x * scale,
+            l.toggle.y * scale,
+            l.toggle.right() * scale,
+            l.toggle.bottom() * scale,
         );
+        l.mode
     }
 
     pub fn toggle(&mut self) {
