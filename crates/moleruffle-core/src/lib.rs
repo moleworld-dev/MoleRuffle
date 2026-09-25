@@ -30,6 +30,7 @@ pub mod cache;
 pub use cache::{cache_dir, CachingNavigator, PENDING_BIG_LOAD_TRIM};
 pub mod mem;
 pub mod server;
+pub mod workers;
 pub use server::{base_url as game_base_url, swf_url as game_swf_url, ServerConfig};
 
 /// 固定舞台尺寸(Client.swf 的逻辑尺寸)。

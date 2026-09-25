@@ -26,7 +26,7 @@ use ruffle_core::loader::Error;
 use ruffle_core::socket::{SocketAction, SocketHandle};
 use url::{ParseError, Url};
 
-use crate::server;
+use crate::{server, workers};
 
 /// 失败重试次数(总尝试 = RETRIES + 1)。只对幂等 GET 生效。抖动网络下瞬时超时重试一次往往就成。
 const RETRIES: u32 = 2;
@@ -122,6 +122,38 @@ fn is_worth_retry(err: &ErrorResponse) -> bool {
     !matches!(err.error, Error::HttpNotOk(_, status, ..) if (400..500).contains(&status))
 }
 
+/// 把 zlib 压缩的 SWF(`CWS`)解成未压缩的 `FWS`,供引擎直接解析。在后台线程调用。
+///
+/// 为什么:引擎拿到 CWS 会在主线程(winit 事件循环)上解压,切场景一次几十个资源 SWF,
+/// 解压全压在主线程上变成可感知的卡顿。缓存层反正要在后台读盘/写盘,顺手在那里解好,
+/// 主线程只做解析。FWS 头:签名 `FWS` + 版本 + 文件总长(含 8 字节头),正文即解压后的数据,
+/// 与引擎 `swf::decompress_swf` 对 CWS 解出的内容逐字节一致(见单测)。
+///
+/// 非 CWS(已是 FWS、LZMA 压缩的 ZWS、非 SWF)原样返回;解压出错也**原样返回压缩数据**,
+/// 交给引擎按原路径处理 —— 引擎对损坏流是"解多少用多少"的容错逻辑,这样行为与以前完全一致。
+pub fn cws_to_fws(bytes: Vec<u8>) -> Vec<u8> {
+    use std::io::Read;
+    if bytes.len() < 8 || &bytes[0..3] != b"CWS" || bytes[3] == 0 {
+        return bytes;
+    }
+    let declared = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+    // 声明长度离谱(<8 或 >256MB)就不碰,交回引擎
+    if !(8..=256 << 20).contains(&declared) {
+        return bytes;
+    }
+    let mut out = Vec::with_capacity(declared);
+    out.extend_from_slice(b"FWS");
+    out.push(bytes[3]);
+    out.extend_from_slice(&[0; 4]);
+    let mut dec = flate2::read::ZlibDecoder::new(&bytes[8..]);
+    if dec.read_to_end(&mut out).is_err() || out.len() > u32::MAX as usize {
+        return bytes;
+    }
+    let total = out.len() as u32;
+    out[4..8].copy_from_slice(&total.to_le_bytes());
+    out
+}
+
 fn write_cache_atomic(path: &PathBuf, bytes: &[u8]) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -179,26 +211,38 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
             .filter(|u| is_cacheable(u, request.body().is_some()))
             .map(|u| self.cache_path(u.as_str()));
 
-        // 缓存命中:直接读盘返回(免网络,秒开)
-        if let Some(path) = &cache_path {
-            if let Ok(bytes) = std::fs::read(path) {
-                CACHE_HITS.fetch_add(1, Ordering::Relaxed);
-                CACHE_HIT_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                tracing::debug!("缓存命中: {url}");
-                let u = url.clone();
-                return Box::pin(async move {
-                    Ok(Box::new(CachedResponse::new(u, bytes)) as Box<dyn SuccessResponse>)
-                });
-            }
-        }
-
-        // 未命中:走网络。GET 幂等,失败/超时重试 RETRIES 次;成功且可缓存(200)则存盘。
-        if cache_path.is_some() {
-            CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
-        }
+        // 只对可缓存的资源 SWF 在后台解压(root Client.swf 不可缓存,保持原样)。
+        let is_swf = url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .ends_with(".swf");
+        // 命中时也返回【绝对】URL,与未命中路径的 final_url 一致。这个 URL 会成为子影片的
+        // loaderInfo.url;以前缓存几乎不生效所以没暴露,现在命中返回相对路径会让两条路径行为不一。
+        let resp_url = abs.as_ref().map(|u| u.to_string()).unwrap_or_else(|| url.clone());
         let inner = self.inner.clone();
         let headers = request.headers().clone();
         Box::pin(async move {
+            // ① 缓存命中:读盘 +(SWF)解压都在后台线程完成,主线程只拿到可直接解析的字节。
+            if let Some(path) = cache_path.clone() {
+                let hit = workers::offload(move || {
+                    let raw = std::fs::read(&path).ok()?;
+                    let disk_len = raw.len();
+                    Some((disk_len, if is_swf { cws_to_fws(raw) } else { raw }))
+                })
+                .await
+                .flatten();
+                if let Some((disk_len, bytes)) = hit {
+                    CACHE_HITS.fetch_add(1, Ordering::Relaxed);
+                    CACHE_HIT_BYTES.fetch_add(disk_len as u64, Ordering::Relaxed);
+                    tracing::debug!("缓存命中: {resp_url}");
+                    return Ok(Box::new(CachedResponse::new(resp_url, bytes)) as Box<dyn SuccessResponse>);
+                }
+                CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
+            }
+
+            // ② 未命中:走网络。GET 幂等,失败/超时重试 RETRIES 次;成功且可缓存(200)则存盘。
             let mut attempt = 0u32;
             loop {
                 // 每次尝试重建一个 GET 请求(原请求已被上一次 fetch 消费)
@@ -217,9 +261,22 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
                         let final_url = resp.url().to_string();
                         match resp.body().await {
                             Ok(bytes) => {
-                                write_cache_atomic(path, &bytes);
-                                CACHE_WRITE_BYTES.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-                                tracing::debug!("缓存写入: {url} ({} 字节)", bytes.len());
+                                // 写盘(存原始压缩数据,不占用户存储)+ 解压都在后台线程。
+                                let p = path.clone();
+                                let prepared = workers::offload(move || {
+                                    write_cache_atomic(&p, &bytes);
+                                    let n = bytes.len();
+                                    (n, if is_swf { cws_to_fws(bytes) } else { bytes })
+                                })
+                                .await;
+                                let Some((n, bytes)) = prepared else {
+                                    return Err(ErrorResponse {
+                                        url,
+                                        error: Error::FetchError("后台线程处理资源失败".into()),
+                                    });
+                                };
+                                CACHE_WRITE_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                                tracing::debug!("缓存写入: {final_url} ({n} 字节)");
                                 return Ok(Box::new(CachedResponse::new(final_url, bytes))
                                     as Box<dyn SuccessResponse>);
                             }
@@ -446,4 +503,87 @@ pub fn trim_cache_in_background() {
             );
         })
         .ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cws_to_fws;
+    use std::io::Write;
+
+    /// 造一个最小但合法的 SWF 正文:舞台矩形 + 帧率 + 帧数 + End 标签 + 若干填充。
+    fn fake_swf_body() -> Vec<u8> {
+        let mut body = vec![
+            0x78, 0x00, 0x05, 0x5F, 0x00, 0x00, 0x0F, 0xA0, 0x00, // RECT(Nbits=15)
+            0x00, 0x18, // 帧率 24.0(fixed8.8)
+            0x01, 0x00, // 1 帧
+        ];
+        body.extend((0..5000u32).map(|i| (i * 31 % 251) as u8)); // 可压缩但不平凡的填充
+        body.extend([0x00, 0x00]); // End
+        body
+    }
+
+    fn make_cws(body: &[u8], version: u8) -> Vec<u8> {
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(body).unwrap();
+        let comp = z.finish().unwrap();
+        let mut out = b"CWS".to_vec();
+        out.push(version);
+        out.extend(((body.len() + 8) as u32).to_le_bytes());
+        out.extend(comp);
+        out
+    }
+
+    #[test]
+    fn 解压结果与引擎自己解出来的逐字节一致() {
+        let cws = make_cws(&fake_swf_body(), 10);
+        let fws = cws_to_fws(cws.clone());
+        assert_eq!(&fws[0..3], b"FWS");
+        let a = ruffle_core::swf::decompress_swf(&cws[..]).expect("引擎解 CWS");
+        let b = ruffle_core::swf::decompress_swf(&fws[..]).expect("引擎解 FWS");
+        assert_eq!(a.data, b.data, "正文必须完全一致");
+        assert_eq!(a.header.version(), b.header.version());
+        assert_eq!(a.header.uncompressed_len(), b.header.uncompressed_len());
+        assert_eq!(a.header.num_frames(), b.header.num_frames());
+    }
+
+    #[test]
+    fn 非压缩或非swf原样返回() {
+        let fws = [b"FWS".as_slice(), &[10, 20, 0, 0, 0], &fake_swf_body()].concat();
+        assert_eq!(cws_to_fws(fws.clone()), fws);
+        let jpg = vec![0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 4, 5, 6];
+        assert_eq!(cws_to_fws(jpg.clone()), jpg);
+        assert_eq!(cws_to_fws(Vec::new()), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn 损坏的压缩流原样交回引擎() {
+        let mut cws = make_cws(&fake_swf_body(), 10);
+        let n = cws.len();
+        cws[n / 2] ^= 0xFF; // 中间翻坏一个字节
+        cws.truncate(n - 10);
+        assert_eq!(cws_to_fws(cws.clone()), cws);
+    }
+
+    #[test]
+    fn 本机缓存里的真实摩尔资源也一致() {
+        // 有缓存就验,没有就跳过(CI 上没有)。
+        let dir = super::cache_root().join("official");
+        let Ok(buckets) = std::fs::read_dir(&dir) else { return };
+        let mut checked = 0;
+        for b in buckets.flatten() {
+            let Ok(files) = std::fs::read_dir(b.path()) else { continue };
+            for f in files.flatten() {
+                let Ok(raw) = std::fs::read(f.path()) else { continue };
+                if raw.len() < 8 || &raw[0..3] != b"CWS" {
+                    continue;
+                }
+                let a = ruffle_core::swf::decompress_swf(&raw[..]).expect("引擎解真实 CWS");
+                let fws = cws_to_fws(raw);
+                let b = ruffle_core::swf::decompress_swf(&fws[..]).expect("引擎解转换后的 FWS");
+                assert_eq!(a.data, b.data, "{:?}", f.path());
+                checked += 1;
+            }
+        }
+        eprintln!("真实 SWF 校验 {checked} 个");
+    }
 }
