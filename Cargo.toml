@@ -47,6 +47,13 @@ lto = "thin"
 codegen-units = 1
 strip = true          # 瘦身(不影响帧率);不加 panic="abort":Ruffle 用 catch_unwind 做 AVM 错误恢复
 
+# 性能剖析专用:优化与 release 完全相同,但保留符号和行号(release 开了 strip,
+# 用 sample / Instruments 采样只能看到地址)。用法:cargo build --profile profiling -p moleruffle-desktop
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"
+strip = false
+
 # dev 构建也给依赖(含 ruffle 解释器)开满优化,这样开发自测时帧率不被 debug 拖垮;
 # 本 workspace 的 crate 仍 opt-level=0(编译快、可调试)。
 [profile.dev.package."*"]
