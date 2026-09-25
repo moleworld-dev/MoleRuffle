@@ -6,6 +6,15 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# 逻辑主体在 lib(src/lib.rs);安卓需要 cdylib(GameActivity 从 .so 的 android_main 进),
+# 桌面/iOS 用 lib + 一个薄 bin。三端共用同一份 lib 代码。
+[lib]
+name = "moleruffle_desktop"
+# MoleRuffle:iOS/桌面只用 lib+bin,cdylib 仅安卓(GameActivity)需要——而安卓现走独立的
+#   ruffle-android 仓,本 crate 的 cdylib 已无用,且它在 iOS 构建时强链 UIKit 触发
+#   "framework not found"(iOS bin 走 winit,无需此)。去掉 cdylib 让 iOS bin 用干净环境编。
+crate-type = ["lib"]
+
 [[bin]]
 name = "moleruffle"
 path = "src/main.rs"
@@ -40,3 +49,21 @@ objc2-ui-kit = { version = "0.2.2", features = [
     # Debug HUD:UIEdgeInsets/safeAreaInsets 需 UIGeometry;monospaced 字体/字重需 UIFontDescriptor。
     "UIGeometry", "UIFontDescriptor",
 ] }
+
+# 安卓:winit 开 android-game-activity(GameActivity 才有 IME/中文软键盘,登录淘米账号要打字);
+# android-activity 版本须与 winit 内部 pin 的一致(0.6.x),否则双入口链接冲突。
+# 非安卓(桌面/iOS):TLS 用 native-tls(苹果走 Security.framework、Win 走 SChannel,不碰 openssl)。
+[target.'cfg(not(target_os = "android"))'.dependencies]
+ruffle_frontend_utils = { workspace = true, features = ["native-tls"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# 安卓:reqwest 用 rustls(纯 Rust),免交叉编译 openssl。
+ruffle_frontend_utils = { workspace = true, features = ["rustls-tls"] }
+winit = { workspace = true, features = ["android-game-activity"] }
+android-activity = { version = "0.6", features = ["game-activity"] }
+android_logger = "0.14"
+log = "0.4"
+paranoid-android = "0.2"
+jni = "0.21"
+ndk = "0.9"
+ndk-context = "0.1"
