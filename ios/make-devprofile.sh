@@ -13,7 +13,11 @@ set -e
 UDID="${1:-00008150-001E10A62132401C}"     # 默认 xcm's iPhone 17 Pro Max
 BUNDLE="com.moleworld.moleruffle"
 PROFILE_NAME="MoleRuffle Dev CLI"
-LOCAL_CERT_SHA1="48455922ECE1FDAE8E6BD93A3B8DDC43D9FE1D81"  # 本机有私钥的 Apple Development 证书
+# 本机有私钥的 Apple Development 证书 SHA1。自动读取,不写死 —— 证书续签/重发后旧值会让
+# 描述文件与签名证书对不上(xcodebuild 报 "doesn't include signing certificate")。可用环境变量覆盖。
+LOCAL_CERT_SHA1="${LOCAL_CERT_SHA1:-$(security find-identity -v -p codesigning | awk '/Apple Development/{print $2; exit}')}"
+[ -n "$LOCAL_CERT_SHA1" ] || { echo "✗ 本机钥匙串里没有 Apple Development 证书" >&2; exit 1; }
+echo "使用本机开发证书 SHA1: $LOCAL_CERT_SHA1"
 
 KEY="$HOME/.appstoreconnect/private_keys/AuthKey_6N5DAM7RXC.p8"
 KEYID="6N5DAM7RXC"

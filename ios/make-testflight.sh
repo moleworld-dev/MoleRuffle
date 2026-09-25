@@ -4,7 +4,8 @@
 # 注入预编译 Rust release 二进制(同 build-device.sh),archive→exportArchive 产出 IPA。
 set -e
 cd "$(dirname "$0")/.."
-export PATH="$HOME/.cargo/bin:$PATH"
+# 正式版 Xcode(SDK 26.x)+ SDKROOT + Java,见 ios/_env.sh 头注释(iOS 27 启动即被终止的根因)。
+source ios/_env.sh
 
 KEY="$HOME/.appstoreconnect/private_keys/AuthKey_6N5DAM7RXC.p8"
 KEYID="6N5DAM7RXC"
@@ -15,6 +16,7 @@ AUTH=(-authenticationKeyPath "$KEY" -authenticationKeyID "$KEYID" -authenticatio
 
 echo "== 1. 编译真机 release 二进制 =="
 cargo +stable build --release --target aarch64-apple-ios -p moleruffle-desktop
+check_binary_sdk target/aarch64-apple-ios/release/moleruffle
 
 echo "== 2. 生成 Xcode 工程 =="
 ( cd ios && xcodegen generate )
