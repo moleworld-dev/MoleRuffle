@@ -16,10 +16,20 @@ cargo +stable build --release --target aarch64-apple-ios -p moleruffle-desktop
 echo "== 2. 生成 Xcode 工程 =="
 ( cd ios && xcodegen generate )
 
-echo "== 3. xcodebuild 自动签名 =="
+echo "== 3. xcodebuild 手动签名(指定含本机设备的开发描述文件)=="
+# 关键:自动签名(-allowProvisioningUpdates)在设备未连时会生成【0 设备】的空开发档,
+# 装机后 iOS 查不到本机 UDID → 启动即弹回桌面(装得上、点了闪退)。
+# 改用 ASC API 预先造好的 "MoleRuffle Dev CLI"(明确含本机 UDID + get-task-allow),彻底避开。
+# 该档由 ios/make-devprofile.sh 生成/更新;换机或过期时重跑它即可。
+PROFILE="MoleRuffle Dev CLI"
 xcodebuild -project ios/MoleRuffle.xcodeproj -scheme MoleRuffle \
   -configuration Debug -destination 'generic/platform=iOS' \
-  -allowProvisioningUpdates -derivedDataPath "$DD" build
+  -derivedDataPath "$DD" \
+  CODE_SIGN_STYLE=Manual \
+  DEVELOPMENT_TEAM=JV2TTWR28G \
+  PROVISIONING_PROFILE_SPECIFIER="$PROFILE" \
+  "CODE_SIGN_IDENTITY=Apple Development" \
+  build
 
 APP="$DD/Build/Products/Debug-iphoneos/moleruffle.app"
 
