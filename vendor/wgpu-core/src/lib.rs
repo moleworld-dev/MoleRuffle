@@ -101,6 +101,25 @@ mod weak_vec;
 mod scratch;
 pub mod validation;
 
+/// MoleRuffle:只读观测计数器(累计值,宿主取差值算每帧数量)。不影响任何行为。
+///
+/// 在 Metal 上,主线程的渲染开销基本正比于"渲染通道数 + 拷贝段数"(每个通道要建一个渲染编码器,
+/// 每段夹在通道之间的连续拷贝要建一个 blit 编码器),所以这两个数是衡量优化效果的确定性指标,
+/// 比毫秒读数稳定得多。
+pub mod mole_stats {
+    use core::sync::atomic::AtomicUsize;
+    /// `command_encoder_finish` 回放过的渲染通道数。
+    pub static RENDER_PASSES: AtomicUsize = AtomicUsize::new(0);
+    /// 其中走了 Metal 单命令缓冲快路径的通道数。
+    pub static FAST_PASSES: AtomicUsize = AtomicUsize::new(0);
+    /// 拷贝段数:紧跟在通道之后(或命令流开头)的一段连续拷贝/清除命令算一段。
+    pub static COPY_SEGMENTS: AtomicUsize = AtomicUsize::new(0);
+    /// 渲染通道里的绘制命令数(Draw / DrawIndexed)。
+    pub static DRAWS: AtomicUsize = AtomicUsize::new(0);
+    /// `command_encoder_finish` 调用次数。
+    pub static FINISHES: AtomicUsize = AtomicUsize::new(0);
+}
+
 pub use validation::{map_storage_format_from_naga, map_storage_format_to_naga};
 
 pub use hal::{api, MAX_BIND_GROUPS, MAX_COLOR_ATTACHMENTS, MAX_VERTEX_BUFFERS};

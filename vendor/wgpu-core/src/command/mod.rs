@@ -1295,6 +1295,36 @@ impl Global {
             let mut debug_scope_depth = 0;
 
             let mut commands = mem::take(&mut cmd_buf_data.commands);
+            // MoleRuffle:观测计数(见 crate::mole_stats),不影响行为。
+            {
+                use core::sync::atomic::Ordering::Relaxed;
+                crate::mole_stats::FINISHES.fetch_add(1, Relaxed);
+                let mut after_pass = true;
+                let (mut passes, mut segments) = (0usize, 0usize);
+                for command in commands.iter() {
+                    match command {
+                        ArcCommand::RunRenderPass { .. } => {
+                            passes += 1;
+                            after_pass = true;
+                        }
+                        ArcCommand::RunComputePass { .. } => after_pass = true,
+                        ArcCommand::CopyBufferToBuffer { .. }
+                        | ArcCommand::CopyBufferToTexture { .. }
+                        | ArcCommand::CopyTextureToBuffer { .. }
+                        | ArcCommand::CopyTextureToTexture { .. }
+                        | ArcCommand::ClearBuffer { .. }
+                        | ArcCommand::ClearTexture { .. } => {
+                            if after_pass {
+                                segments += 1;
+                            }
+                            after_pass = false;
+                        }
+                        _ => {}
+                    }
+                }
+                crate::mole_stats::RENDER_PASSES.fetch_add(passes, Relaxed);
+                crate::mole_stats::COPY_SEGMENTS.fetch_add(segments, Relaxed);
+            }
             for command in commands.drain(..) {
                 if matches!(
                     command,

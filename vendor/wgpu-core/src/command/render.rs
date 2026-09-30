@@ -1872,8 +1872,11 @@ pub(super) fn encode_render_pass(
     // Ruffle 一帧几十个通道(每个滤镜 2q+1 个),实测这部分占渲染主线程约 27%。
     //
     // 快路径把通道直接续写进当前命令缓冲,不开 Pre Pass。进入条件保证 Pre Pass 本来就是空的:
-    //   1. 没有"已丢弃未重新初始化"的表面 → pending_discard_init_fixups 在整个通道内必为空
-    //      (它只来自 register_init_action,而后者只从 discards 列表取;discards 只在通道结束时新增);
+    //   1. 进入时没有"已丢弃未重新初始化"的表面,且本通道所有附件的存储方式都是 Store
+    //      → pending_discard_init_fixups 在整个通道内必为空。它只来自 register_init_action,
+    //      后者只从 discards 列表里取;而 discards 是在通道【开始】时、对存储方式为 Discard 的
+    //      附件登记的(RenderPassInfo::add_pass_texture_init_actions)。两个条件合起来,
+    //      discards 从通道开始到结束一直是空的;
     //   2. 没有时间戳/遮挡查询/管线统计查询 → pending_query_resets 必为空;
     //   3. 间接绘制校验关闭 → 不需要注入校验通道;
     //   4. 后端是 Metal → transition_buffers/transition_textures 不产生命令,只需合并跟踪状态。
@@ -1884,6 +1887,13 @@ pub(super) fn encode_render_pass(
         && timestamp_writes.is_none()
         && occlusion_query_set.is_none()
         && !parent_state.texture_memory_actions.has_discards()
+        && color_attachments
+            .iter()
+            .flatten()
+            .all(|at| at.store_op == StoreOp::Store)
+        && depth_stencil_attachment.as_ref().is_none_or(|at| {
+            at.depth.store_op() == StoreOp::Store && at.stencil.store_op() == StoreOp::Store
+        })
         && !base.commands.iter().any(|c| {
             matches!(
                 c,
@@ -1892,6 +1902,25 @@ pub(super) fn encode_render_pass(
                     | ArcRenderCommand::BeginPipelineStatisticsQuery { .. }
             )
         });
+
+    {
+        // MoleRuffle:观测计数(见 crate::mole_stats),不影响行为。
+        use core::sync::atomic::Ordering::Relaxed;
+        let draws = base
+            .commands
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c,
+                    ArcRenderCommand::Draw { .. } | ArcRenderCommand::DrawIndexed { .. }
+                )
+            })
+            .count();
+        crate::mole_stats::DRAWS.fetch_add(draws, Relaxed);
+        if mole_fast {
+            crate::mole_stats::FAST_PASSES.fetch_add(1, Relaxed);
+        }
+    }
 
     let raw_encoder = if mole_fast {
         parent_state
@@ -2299,7 +2328,13 @@ pub(super) fn encode_render_pass(
     if mole_fast {
         // MoleRuffle:快路径 —— 命令缓冲保持打开,后续通道/拷贝继续写入同一个 MTLCommandBuffer。
         // 进入条件已保证这两个集合为空(见上);仍照原顺序调用,空集合时都是空操作。
-        debug_assert!(pending_discard_init_fixups.is_empty());
+        if !pending_discard_init_fixups.is_empty() {
+            // 按上面的论证不可能发生。真发生了说明进入条件有漏洞:这些清除本该排在通道之前,
+            // 现在只能排在之后执行。发布版也要留下痕迹。
+            log::error!(
+                "MoleRuffle: Metal 单命令缓冲快路径里出现了待修复的丢弃表面,请设 MOLE_METAL_SINGLE_CB=0 并反馈"
+            );
+        }
         let raw = encoder.open_if_closed().map_pass_err(pass_scope)?;
         fixup_discarded_surfaces(
             pending_discard_init_fixups.into_iter(),

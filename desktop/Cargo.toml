@@ -29,6 +29,8 @@ ruffle_frontend_utils.workspace = true
 
 url.workspace = true
 wgpu.workspace = true
+# 只为读 vendor/wgpu-core 里的 mole_stats 观测计数器([perf] 行的 通道/拷贝段/绘制 每帧数量)。
+wgpu-core = { version = "27.0.3", default-features = false }
 winit.workspace = true
 raw-window-handle.workspace = true
 futures.workspace = true

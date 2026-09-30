@@ -305,7 +305,9 @@ const BUNDLED_FONT: &[u8] = include_bytes!("../assets/molefont.ttf");
 /// 其余方法全部 no-op(本客户端不需要剪贴板/对话框等)。
 #[derive(Clone)]
 pub struct MoleUiBackend {
-    fonts: Arc<fontdb::Database>,
+    /// 系统字体库。要用 `make_shared_face_data`(需要 &mut)把字体文件改成共享映射,所以包一层锁;
+    /// 只在首次用到某个(字体名, 粗, 斜)组合时访问,没有竞争。
+    fonts: Arc<std::sync::Mutex<fontdb::Database>>,
     /// 应用内剪贴板兜底(移动端无系统剪贴板时用;桌面也作镜像)。
     clip: Arc<std::sync::Mutex<String>>,
     /// 是否需要弹出软键盘:Flash 文本框聚焦时引擎调 open_virtual_keyboard 置 true,
@@ -333,7 +335,7 @@ impl MoleUiBackend {
         }
         tracing::info!("MoleUiBackend: 载入 {} 个字体面", db.len());
         Self {
-            fonts: Arc::new(db),
+            fonts: Arc::new(std::sync::Mutex::new(db)),
             clip: Arc::new(std::sync::Mutex::new(String::new())),
             kbd: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
@@ -364,22 +366,28 @@ impl MoleUiBackend {
             },
             ..Default::default()
         };
-        let Some(id) = self.fonts.query(&q) else {
+        let mut fonts = self.fonts.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(id) = fonts.query(&q) else {
             return false;
         };
-        let def = self.fonts.with_face_data(id, |data, index| FontDefinition::FontFile {
+        // ★共享映射,不复制★:原先这里 `data.to_vec()` 把整个字体文件复制进堆,而且每个
+        // (字体名, 粗, 斜)组合各复制一份 —— 苹方 PingFang.ttc 有 78MB,登录页就被复制了 4 次
+        // (实测 313MB 物理内存,外加 4 次主线程上的整份拷贝)。`make_shared_face_data` 把文件
+        // 映射进来并让同一文件的所有字体面共用这一份;映射页由文件支撑、按需换入,不计入物理足迹。
+        // SAFETY: 映射的是只读的系统字体文件。与上游 Ruffle 桌面版同样的前提:进程运行期间
+        // 系统不会就地截断/改写这些文件(系统更新是整文件替换,旧映射仍然有效)。
+        let Some((data, index)) = (unsafe { fonts.make_shared_face_data(id) }) else {
+            return false;
+        };
+        drop(fonts);
+        register(FontDefinition::FontFile {
             name: query.name.clone(),
             is_bold: query.is_bold,
             is_italic: query.is_italic,
-            data: FontFileData::new(data.to_vec()),
+            data: FontFileData::new_shared(data),
             index,
         });
-        if let Some(def) = def {
-            register(def);
-            true
-        } else {
-            false
-        }
+        true
     }
 }
 
