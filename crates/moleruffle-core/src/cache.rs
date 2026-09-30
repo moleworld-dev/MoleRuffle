@@ -31,6 +31,19 @@ use crate::{server, workers};
 /// 失败重试次数(总尝试 = RETRIES + 1)。只对幂等 GET 生效。抖动网络下瞬时超时重试一次往往就成。
 const RETRIES: u32 = 2;
 
+/// ★对冲请求★:发往游戏服务器的 GET,距首次发起过了这些时间点还没拿到结果,就【并发】再发一次,
+/// 谁先成功用谁(其余的随 future 被丢弃而取消)。
+///
+/// 为什么:这台服务器的典型病症是"同一个请求这次卡几十秒、紧接着再请求只要 0.6 秒"
+/// (实测 163 字节的 XML 0.6~7.6 秒,20KB 的 Client.swf 0.6~36 秒)。顺序重试只在【失败】后才触发,
+/// 对"卡着不回"无能为力,而 HTTP 层只设了连接超时、没有整体超时(怕误杀慢但正常的大文件)。
+/// 对冲不取消慢的那个,所以不会误杀;正常情况下 2.5 秒内就回来了,不会多发请求。
+const HEDGE_AT: [Duration; 3] = [
+    Duration::from_millis(2500),
+    Duration::from_secs(6),
+    Duration::from_secs(12),
+];
+
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// 缓存运行时统计(全局):命中数 / 未命中数 / 命中读盘字节 / 写盘字节。
@@ -39,6 +52,8 @@ pub static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 pub static CACHE_HIT_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static CACHE_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+/// 触发过对冲(慢请求并发重发)的次数,观测用。
+pub static HEDGED_REQUESTS: AtomicU64 = AtomicU64::new(0);
 
 /// MoleRuffle:大加载信号(P0 内存事故缓解)。navigator 一看到 .swf 请求(切场景/魔灵等
 /// 小游戏)就置位;壳的内存守卫下个 tick 消费它,抢在资源解码落地前 force_gc+清池腾余量。
@@ -223,6 +238,15 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
         let resp_url = abs.as_ref().map(|u| u.to_string()).unwrap_or_else(|| url.clone());
         let inner = self.inner.clone();
         let headers = request.headers().clone();
+        // 只对冲发往当前游戏服务器的请求(静态资源、配置、root SWF);登录等其它主机的 GET 保持
+        // 原来的"失败后顺序重试",不并发重发。
+        let on_game_host =
+            abs.as_ref().is_some_and(|u| u.host_str() == Some(server::selected().host));
+        let hedge = on_game_host && request.body().is_none();
+        let is_root = on_game_host
+            && abs
+                .as_ref()
+                .is_some_and(|u| u.path().eq_ignore_ascii_case("/client.swf"));
         Box::pin(async move {
             // ① 缓存命中:读盘 +(SWF)解压都在后台线程完成,主线程只拿到可直接解析的字节。
             if let Some(path) = cache_path.clone() {
@@ -242,63 +266,105 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
                 CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
             }
 
-            // ② 未命中:走网络。GET 幂等,失败/超时重试 RETRIES 次;成功且可缓存(200)则存盘。
-            let mut attempt = 0u32;
-            loop {
-                // 每次尝试重建一个 GET 请求(原请求已被上一次 fetch 消费)
+            // ② 未命中:走网络。GET 幂等:失败重试至多 RETRIES 次;发往游戏服务器的请求卡住时并发对冲
+            //    (见 HEDGE_AT)。要读 body 的(可缓存资源、root SWF)把"取头 + 读完 body"算作一次尝试,
+            //    这样 body 传到一半卡住也能被对冲救回;其余的拿到响应头就算成功,原样交回引擎
+            //    (XML/文本的字符集信息在原响应对象上,不能换成我们自己的包装)。
+            enum Fetched {
+                Response(Box<dyn SuccessResponse>),
+                Body { final_url: String, bytes: Vec<u8> },
+            }
+            let want_body = cache_path.is_some() || is_root;
+            let make_attempt = || {
+                // 每次尝试重建一个 GET 请求(原请求已被消费)
                 let mut req = Request::get(url.clone());
                 req.set_headers(headers.clone());
                 // 借用只在同步的 fetch() 调用期间持有,拿到 future 后立刻释放,绝不跨 await
                 let fut = inner.borrow().fetch(req);
-                match fut.await {
-                    Ok(resp) => {
-                        let Some(path) = &cache_path else {
-                            return Ok(resp); // 可重试但不缓存(如 account.61.com 的 GET)
-                        };
-                        if resp.status() != 200 {
-                            return Ok(resp); // 非 200 不缓存,原样返回
-                        }
-                        let final_url = resp.url().to_string();
-                        match resp.body().await {
-                            Ok(bytes) => {
-                                // 写盘(存原始压缩数据,不占用户存储)+ 解压都在后台线程。
-                                let p = path.clone();
-                                let prepared = workers::offload(move || {
-                                    write_cache_atomic(&p, &bytes);
-                                    let n = bytes.len();
-                                    (n, if is_swf { cws_to_fws(bytes) } else { bytes })
-                                })
-                                .await;
-                                let Some((n, bytes)) = prepared else {
-                                    return Err(ErrorResponse {
-                                        url,
-                                        error: Error::FetchError("后台线程处理资源失败".into()),
-                                    });
-                                };
-                                CACHE_WRITE_BYTES.fetch_add(n as u64, Ordering::Relaxed);
-                                tracing::debug!("缓存写入: {final_url} ({n} 字节)");
-                                return Ok(Box::new(CachedResponse::new(final_url, bytes))
-                                    as Box<dyn SuccessResponse>);
-                            }
-                            Err(error) => {
-                                if attempt < RETRIES {
-                                    attempt += 1;
-                                    tracing::debug!("读 body 失败,重试 {attempt}/{RETRIES}: {url}");
-                                    continue;
-                                }
-                                return Err(ErrorResponse { url, error });
-                            }
-                        }
+                let url = url.clone();
+                Box::pin(async move {
+                    let resp = fut.await?;
+                    if !want_body || resp.status() != 200 {
+                        return Ok(Fetched::Response(resp)); // 非 200 不缓存,原样返回
                     }
-                    Err(err) => {
+                    let final_url = resp.url().to_string();
+                    match resp.body().await {
+                        Ok(bytes) => Ok(Fetched::Body { final_url, bytes }),
+                        Err(error) => Err(ErrorResponse { url, error }),
+                    }
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<Fetched, ErrorResponse>>>>
+            };
+
+            use futures::future::{Either, select};
+            use futures::stream::{FuturesUnordered, StreamExt};
+            let started = std::time::Instant::now();
+            let mut in_flight = FuturesUnordered::new();
+            in_flight.push(make_attempt());
+            let mut launched = 1usize;
+            let mut failures = 0u32;
+            let fetched = loop {
+                // 下一次对冲的时间点;不对冲(别的主机)或名额用完就只等在途的尝试。
+                let hedge_timer = match (hedge, HEDGE_AT.get(launched - 1)) {
+                    (true, Some(at)) => Either::Left(async_io::Timer::at(started + *at)),
+                    _ => Either::Right(futures::future::pending::<std::time::Instant>()),
+                };
+                match select(in_flight.next(), hedge_timer).await {
+                    Either::Left((Some(Ok(fetched)), _)) => break fetched,
+                    Either::Left((Some(Err(err)), _)) => {
                         // 4xx 是确定性失败(资源真不存在),重试只是把一次 404 放大成 3 次请求。
-                        if attempt < RETRIES && is_worth_retry(&err) {
-                            attempt += 1;
-                            tracing::debug!("拉取失败,重试 {attempt}/{RETRIES}: {url}");
-                            continue;
+                        failures += 1;
+                        if failures > RETRIES || !is_worth_retry(&err) {
+                            return Err(err);
                         }
-                        return Err(err);
+                        tracing::debug!("拉取失败,重试 {failures}/{RETRIES}: {url}");
+                        if in_flight.is_empty() {
+                            in_flight.push(make_attempt());
+                            launched += 1;
+                        }
                     }
+                    Either::Left((None, _)) => {
+                        // 不会发生(失败分支保证至少留一个在途),以防万一补一个。
+                        in_flight.push(make_attempt());
+                        launched += 1;
+                    }
+                    Either::Right(_) => {
+                        tracing::info!(
+                            "请求 {:.1} 秒没回,并发再发一次(第 {} 个): {url}",
+                            started.elapsed().as_secs_f32(),
+                            launched + 1
+                        );
+                        HEDGED_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                        in_flight.push(make_attempt());
+                        launched += 1;
+                    }
+                }
+            };
+            drop(in_flight); // 取消其余在途的尝试
+
+            match fetched {
+                Fetched::Response(resp) => Ok(resp),
+                Fetched::Body { final_url, bytes } => {
+                    let Some(path) = cache_path else {
+                        // root SWF:不进磁盘缓存(版本闸),body 已读完,直接交给引擎。
+                        return Ok(Box::new(CachedResponse::new(final_url, bytes))
+                            as Box<dyn SuccessResponse>);
+                    };
+                    // 写盘(存原始压缩数据,不占用户存储)+ 解压都在后台线程。
+                    let prepared = workers::offload(move || {
+                        write_cache_atomic(&path, &bytes);
+                        let n = bytes.len();
+                        (n, if is_swf { cws_to_fws(bytes) } else { bytes })
+                    })
+                    .await;
+                    let Some((n, bytes)) = prepared else {
+                        return Err(ErrorResponse {
+                            url,
+                            error: Error::FetchError("后台线程处理资源失败".into()),
+                        });
+                    };
+                    CACHE_WRITE_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+                    tracing::debug!("缓存写入: {final_url} ({n} 字节)");
+                    Ok(Box::new(CachedResponse::new(final_url, bytes)) as Box<dyn SuccessResponse>)
                 }
             }
         })

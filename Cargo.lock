@@ -2472,10 +2472,12 @@ version = "0.1.0"
 dependencies = [
  "arboard",
  "async-channel",
+ "async-io",
  "dirs",
  "encoding_rs",
  "flate2",
  "fontdb",
+ "futures",
  "indexmap",
  "objc2-foundation 0.2.2",
  "objc2-ui-kit",
