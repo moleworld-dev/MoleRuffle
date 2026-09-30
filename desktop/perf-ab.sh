@@ -56,7 +56,7 @@ for spec in "$@"; do
 import re, sys, statistics as st
 tag = sys.argv[1]
 avg, peak, fps, gp = [], [], [], []
-kinds = dirty = ""
+kinds = dirty = memo = ""
 for l in sys.stdin:
     m = re.search(r"\[perf\] FPS\s+(\d+).*?render 均\s*([\d.]+)/峰\s*([\d.]+)ms", l)
     if m:
@@ -64,13 +64,13 @@ for l in sys.stdin:
     g = re.search(r"每帧 通道\s*([\d.]+)\((.*?)\) 拷贝段\s*([\d.]+) 绘制\s*([\d.]+)", l)
     if g:
         gp.append((float(g[1]), float(g[3]), float(g[4]))); kinds = g[2]
-    d = re.search(r"脏矩形 (.*?) \| 离屏", l)
+    d = re.search(r"脏矩形 (.*?) \| 烘焙 (.*?) \| ", l)
     if d:
-        dirty = d[1]
+        dirty = d[1]; memo = d[2]
 if not avg:
     print(f"[{tag}] 采样窗口内没有 [perf] 行"); sys.exit()
 print(f"[{tag}] {len(avg)} 个窗口 | FPS 中位 {st.median(fps):.0f} | render 均值: 中位 {st.median(avg):.2f}ms 最小 {min(avg):.2f} 最大 {max(avg):.2f} | 单帧峰值中位 {st.median(peak):.2f}ms"
-      + (f" | 每帧 通道 {st.median(x[0] for x in gp):.1f} 拷贝段 {st.median(x[1] for x in gp):.1f} 绘制 {st.median(x[2] for x in gp):.1f} | 末窗来源 {kinds} | 末窗脏矩形 {dirty}" if gp else ""))
+      + (f" | 每帧 通道 {st.median(x[0] for x in gp):.1f} 拷贝段 {st.median(x[1] for x in gp):.1f} 绘制 {st.median(x[2] for x in gp):.1f} | 末窗来源 {kinds} | 末窗脏矩形 {dirty} | 末窗烘焙 {memo}" if gp else ""))
 ' "$tag"
   errs=$(grep -ciE "wgpu.*(error|validation)|panicked" "$out/log.txt")
   [[ $errs != 0 ]] && { echo "[$tag] ⚠ 日志里有 $errs 行 wgpu 报错/崩溃:"; grep -iE "wgpu.*(error|validation)|panicked" "$out/log.txt" | head -5; }
