@@ -98,6 +98,8 @@ struct App {
     viewport: (u32, u32),
     /// 软键盘请求标志(来自 MoleUiBackend)+ 当前是否已开启,用于按需 set_ime_allowed。
     kbd: Option<Arc<AtomicBool>>,
+    /// 主 SWF 加载失败后的重试:(下次重试时刻, 已失败次数)。见 mole::ROOT_LOAD_FAILED。
+    root_retry: (Option<Instant>, u32),
     kbd_on: bool,
     /// iOS 纯触摸复制/粘贴工具条(文本框聚焦时显示)。
     #[cfg(target_os = "ios")]
@@ -287,6 +289,7 @@ impl App {
             last_mem_check: Instant::now(),
             viewport: (0, 0),
             kbd: None,
+            root_retry: (None, 0),
             kbd_on: false,
             #[cfg(target_os = "ios")]
             textbar: None,
@@ -1037,6 +1040,33 @@ impl ApplicationHandler<UserEvent> for App {
     // 锁帧驱动:推进 tokio 异步 + 按 SWF 帧率 tick + 仅脏时请求重绘 + 睡到下一帧(渲染在 RedrawRequested 做)
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         enter_runtime!(self);
+        // 主 SWF 加载失败 → 退避后重新发起(2、4、8 秒,之后每 10 秒),直到成功。
+        // 没有它,启动时网络抖一下就永久黑屏;有了它,断网启动后连上网会自己恢复。
+        if mole::ROOT_LOAD_FAILED.swap(false, Ordering::Relaxed) {
+            self.root_retry.1 += 1;
+            let wait = Duration::from_secs(match self.root_retry.1 {
+                1 => 2,
+                2 => 4,
+                3 => 8,
+                _ => 10,
+            });
+            self.root_retry.0 = Some(Instant::now() + wait);
+            tracing::warn!(
+                "主 SWF 第 {} 次加载失败,{} 秒后重试",
+                self.root_retry.1,
+                wait.as_secs()
+            );
+        }
+        if self.root_retry.0.is_some_and(|at| Instant::now() >= at) {
+            self.root_retry.0 = None;
+            self.with_player(|p| {
+                p.fetch_root_movie(
+                    mole::server::selected().swf_url.to_string(),
+                    vec![],
+                    Box::new(|_| {}),
+                );
+            });
+        }
         // 软键盘 + iOS 文本工具条按需开关:Flash 文本框聚焦→标志 true→弹软键盘+显示工具条;失焦→收起。
         if let Some(kbd) = &self.kbd {
             let want = kbd.load(Ordering::Relaxed);

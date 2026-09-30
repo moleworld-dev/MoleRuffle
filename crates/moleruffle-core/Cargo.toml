@@ -21,6 +21,9 @@ unic-langid = "0.9"
 encoding_rs = "0.8"
 indexmap = "2"
 async-channel = "2"
+# 对冲请求(慢请求并发重发)需要的并发组合子与定时器;两者都已在依赖图里(ruffle 前端工具在用)。
+futures.workspace = true
+async-io = "2"
 # 缓存层在后台线程把 CWS(zlib 压缩)SWF 解成 FWS 再交给引擎,主线程不再解压。
 # 只开 zlib-rs 后端(依赖图里已经在用,不再额外拉 miniz_oxide);版本与 ruffle 对齐。
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }

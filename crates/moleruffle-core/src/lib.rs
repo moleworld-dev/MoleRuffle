@@ -297,6 +297,11 @@ const FONT_FALLBACKS: &[&str] = &[
 /// 支持 CFF;`include_bytes!` 编进 .rodata,`FontFileData::new(BUNDLED_FONT)` 对 &'static 零拷贝。
 const BUNDLED_FONT: &[u8] = include_bytes!("../assets/molefont.ttf");
 
+/// 主 SWF 加载失败标志:`MoleUiBackend` 收到引擎的失败回调时置位,平台壳在主循环里消费它、
+/// 退避几秒后重新调 `fetch_root_movie`。不处理的话一次网络抖动就永久黑屏(官方服确实会这样)。
+pub static ROOT_LOAD_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// MoleRuffle 的 `UiBackend`。
 ///
 /// 默认的 `NullUiBackend` 不提供任何设备字体,导致摩尔庄园所有动态文本
@@ -476,7 +481,15 @@ impl UiBackend for MoleUiBackend {
     fn set_fullscreen(&mut self, _is_full: bool) -> Result<(), FullscreenError> {
         Ok(())
     }
-    fn display_root_movie_download_failed_message(&self, _invalid_swf: bool, _fetch_error: String) {}
+    fn display_root_movie_download_failed_message(&self, invalid_swf: bool, fetch_error: String) {
+        // 主 SWF 下载失败(导航层的重试与对冲都用尽了)。引擎到此为止不会再试,屏幕就一直黑着。
+        // 置个标志,由平台壳退避后重新发起(见 ROOT_LOAD_FAILED)。
+        tracing::warn!(
+            "主 SWF 加载失败({}): {fetch_error}",
+            if invalid_swf { "内容无效" } else { "下载失败" }
+        );
+        ROOT_LOAD_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     fn message(&self, _message: &str) {}
     fn display_unsupported_video(&self, _url: Url) {}
     fn sort_device_fonts(
