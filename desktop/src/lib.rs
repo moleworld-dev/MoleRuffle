@@ -116,6 +116,10 @@ struct App {
     last_empty: u64,
     /// 上次一帧 render() 的 CPU 耗时(微秒),桌面性能基线用(构建+提交命令的 CPU 成本,不含 GPU 异步执行)。
     last_render_us: u128,
+    /// [perf] 统计窗口内 render() 的累计耗时 / 帧数 / 最大值(微秒)。单帧读数抖动大,前后对比用平均值。
+    perf_render_sum_us: u128,
+    perf_render_n: u32,
+    perf_render_max_us: u128,
     /// 延迟测量:最近一次尚未被渲染消费的输入(点击/按键)时刻。
     /// 下一次 redraw_now 消费并打印"输入→本帧提交"的客户端延迟(不含 present 与服务器往返)。
     #[cfg(not(target_os = "ios"))]
@@ -287,6 +291,9 @@ impl App {
             last_offscreen: 0,
             last_empty: 0,
             last_render_us: 0,
+            perf_render_sum_us: 0,
+            perf_render_n: 0,
+            perf_render_max_us: 0,
             #[cfg(not(target_os = "ios"))]
             pending_input: None,
             #[cfg(target_os = "ios")]
@@ -478,6 +485,9 @@ impl App {
         #[cfg(not(target_os = "ios"))]
         {
             self.last_render_us = _rt.elapsed().as_micros();
+            self.perf_render_sum_us += self.last_render_us;
+            self.perf_render_n += 1;
+            self.perf_render_max_us = self.perf_render_max_us.max(self.last_render_us);
             // 延迟测量:输入(点击/按键)→ 本帧提交的客户端管线耗时。
             // 不含 present(Immediate ≈0-8ms)与服务器往返(走路确认等,另测 RTT)。
             if let Some(t0) = self.pending_input.take() {
@@ -1138,12 +1148,17 @@ impl ApplicationHandler<UserEvent> for App {
                 self.last_empty = empty_now;
 
                 let res_mb = ruffle_render::evict::RESIDENT_BYTES.load(Relaxed) / (1024 * 1024);
-                let render_ms = self.last_render_us as f64 / 1000.0;
+                let render_ms =
+                    self.perf_render_sum_us as f64 / 1000.0 / self.perf_render_n.max(1) as f64;
+                let render_max_ms = self.perf_render_max_us as f64 / 1000.0;
+                self.perf_render_sum_us = 0;
+                self.perf_render_n = 0;
+                self.perf_render_max_us = 0;
                 let (ch, cm, chb, _) = mole::cache::cache_summary();
                 let hit_pct = if ch + cm > 0 { ch * 100 / (ch + cm) } else { 0 };
                 let cache_mb = chb / (1024 * 1024);
                 tracing::info!(
-                    "[perf] FPS {fps:>4.0} | render {render_ms:>5.2}ms | 离屏churn 池{pool_mb_s:>4.0}/empty{empty_mb_s:>4.0} MB/s | 常驻 {res_mb}MB | 缓存命中 {ch}/{}({hit_pct}%) 省下载 {cache_mb}MB",
+                    "[perf] FPS {fps:>4.0} | render 均{render_ms:>5.2}/峰{render_max_ms:>5.2}ms | 离屏churn 池{pool_mb_s:>4.0}/empty{empty_mb_s:>4.0} MB/s | 常驻 {res_mb}MB | 缓存命中 {ch}/{}({hit_pct}%) 省下载 {cache_mb}MB",
                     ch + cm
                 );
             }
