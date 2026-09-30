@@ -65,6 +65,16 @@ pub fn apply_mole_settings(builder: PlayerBuilder) -> PlayerBuilder {
     // 整屏闪白很刺眼。影片自己的背景色一旦生效照常使用。见 ruffle-fork player.rs。
     // SAFETY: 同上,启动期单线程调用。
     unsafe { std::env::set_var("MOLE_DEFAULT_BG_BLACK", "1"); }
+    // ★Metal 单命令缓冲(vendor/wgpu-core 补丁,见根 Cargo.toml 的 [patch.crates-io])★:
+    // 官方 wgpu-core 给每个渲染通道开 2 个 MTLCommandBuffer(其中 "Pre Pass" 在 Metal 上恒为空),
+    // 通道之间的每段上传拷贝再开 1 个。摩尔庄园一帧几十个通道(每个发光滤镜 2×quality+1 个),
+    // 命令缓冲的创建/提交占了渲染主线程的一多半。补丁让通道续写进同一个命令缓冲,渲染命令与顺序不变。
+    // 实测桌面登录页 render() 6.4ms → 2.7ms(desktop/perf-ab.sh 交替三轮)。只对 Metal 生效,其它后端
+    // 走原路径;紧急回退:启动前设 MOLE_METAL_SINGLE_CB=0。开关在第一个渲染通道时读取一次,必须早于首帧。
+    // SAFETY: 同上,启动期单线程调用。
+    if std::env::var_os("MOLE_METAL_SINGLE_CB").is_none() {
+        unsafe { std::env::set_var("MOLE_METAL_SINGLE_CB", "1"); }
+    }
 
     // 画质/MSAA:iOS 真机关 MSAA(Low=1x)。Apple GPU 最大 4x MSAA,High8x8 在真机被钳到 4x、
     // 仍要按全屏物理像素(~2868×1320)分配 ~90MB+ MSAA framebuffer,且乘进每个滤镜/cacheAsBitmap
