@@ -2515,6 +2515,7 @@ dependencies = [
  "tracing-subscriber",
  "url",
  "wgpu",
+ "wgpu-core",
  "winit",
 ]
 

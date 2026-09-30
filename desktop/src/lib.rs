@@ -120,6 +120,12 @@ struct App {
     perf_render_sum_us: u128,
     perf_render_n: u32,
     perf_render_max_us: u128,
+    /// [perf] 上次取样时 wgpu-core 观测计数器的累计值(通道 / 拷贝段 / 绘制),取差值算每帧数量。
+    perf_gpu_last: [usize; 3],
+    /// [perf] 上次取样时各来源通道数的累计值(下标见 ruffle_render::evict::PassKind)。
+    perf_kind_last: [usize; ruffle_render::evict::PASS_KIND_COUNT],
+    /// [perf] 上次取样时脏矩形统计的累计值(见 ruffle_render::evict::DIRTY_STATS)。
+    perf_dirty_last: [usize; 7],
     /// 延迟测量:最近一次尚未被渲染消费的输入(点击/按键)时刻。
     /// 下一次 redraw_now 消费并打印"输入→本帧提交"的客户端延迟(不含 present 与服务器往返)。
     #[cfg(not(target_os = "ios"))]
@@ -294,6 +300,9 @@ impl App {
             perf_render_sum_us: 0,
             perf_render_n: 0,
             perf_render_max_us: 0,
+            perf_gpu_last: [0; 3],
+            perf_kind_last: [0; ruffle_render::evict::PASS_KIND_COUNT],
+            perf_dirty_last: [0; 7],
             #[cfg(not(target_os = "ios"))]
             pending_input: None,
             #[cfg(target_os = "ios")]
@@ -1151,6 +1160,53 @@ impl ApplicationHandler<UserEvent> for App {
                 let render_ms =
                     self.perf_render_sum_us as f64 / 1000.0 / self.perf_render_n.max(1) as f64;
                 let render_max_ms = self.perf_render_max_us as f64 / 1000.0;
+                // 每帧的渲染通道 / 拷贝段 / 绘制数量(确定性指标,比毫秒稳定;Metal 上主线程渲染开销
+                // 基本正比于前两个数)。
+                let gpu_now = [
+                    wgpu_core::mole_stats::RENDER_PASSES.load(Relaxed),
+                    wgpu_core::mole_stats::COPY_SEGMENTS.load(Relaxed),
+                    wgpu_core::mole_stats::DRAWS.load(Relaxed),
+                ];
+                let n = self.perf_render_n.max(1) as f64;
+                let gpu_last = self.perf_gpu_last;
+                let per_frame = |i: usize| gpu_now[i].saturating_sub(gpu_last[i]) as f64 / n;
+                let (passes, segments, draws) = (per_frame(0), per_frame(1), per_frame(2));
+                self.perf_gpu_last = gpu_now;
+                // 通道来源:主舞台 / 混合层 / 缓存位图内容 / 滤镜 / 拷贝 / 清屏 / BitmapData.draw / 其它。
+                let mut kinds = [0.0f64; ruffle_render::evict::PASS_KIND_COUNT];
+                for (i, k) in kinds.iter_mut().enumerate() {
+                    let now = ruffle_render::evict::PASS_KINDS[i].load(Relaxed);
+                    *k = now.saturating_sub(self.perf_kind_last[i]) as f64 / n;
+                    self.perf_kind_last[i] = now;
+                }
+                let kinds = format!(
+                    "主{:.1} 混{:.1} 缓{:.1} 滤{:.1} 拷{:.1} 清{:.1} 位{:.1} 它{:.1}",
+                    kinds[0], kinds[1], kinds[2], kinds[3], kinds[4], kinds[5], kinds[6], kinds[7]
+                );
+                // 脏矩形渲染:本窗口内 整帧重画 / 局部重画 / 无变化 的帧数,局部帧平均的矩形数、
+                // 脏区面积占比、重画单元数 / 单元总数。
+                let mut dirty = [0usize; 7];
+                for (i, d) in dirty.iter_mut().enumerate() {
+                    let now = ruffle_render::evict::DIRTY_STATS[i].load(Relaxed);
+                    *d = now.saturating_sub(self.perf_dirty_last[i]);
+                    self.perf_dirty_last[i] = now;
+                }
+                let dirty = if dirty[0] + dirty[1] + dirty[2] == 0 {
+                    "关".to_string()
+                } else {
+                    let partial = (dirty[1] + dirty[2]).max(1) as f64;
+                    let frames = (dirty[0] + dirty[1] + dirty[2]) as f64;
+                    format!(
+                        "整{} 局{} 静{} 矩形{:.1} 面积{:.1}% 单元{:.0}/{:.0}",
+                        dirty[0],
+                        dirty[1],
+                        dirty[2],
+                        dirty[3] as f64 / partial,
+                        dirty[4] as f64 / partial / 10.0,
+                        dirty[5] as f64 / frames,
+                        dirty[6] as f64 / frames,
+                    )
+                };
                 self.perf_render_sum_us = 0;
                 self.perf_render_n = 0;
                 self.perf_render_max_us = 0;
@@ -1158,7 +1214,7 @@ impl ApplicationHandler<UserEvent> for App {
                 let hit_pct = if ch + cm > 0 { ch * 100 / (ch + cm) } else { 0 };
                 let cache_mb = chb / (1024 * 1024);
                 tracing::info!(
-                    "[perf] FPS {fps:>4.0} | render 均{render_ms:>5.2}/峰{render_max_ms:>5.2}ms | 离屏churn 池{pool_mb_s:>4.0}/empty{empty_mb_s:>4.0} MB/s | 常驻 {res_mb}MB | 缓存命中 {ch}/{}({hit_pct}%) 省下载 {cache_mb}MB",
+                    "[perf] FPS {fps:>4.0} | render 均{render_ms:>5.2}/峰{render_max_ms:>5.2}ms | 每帧 通道{passes:>5.1}({kinds}) 拷贝段{segments:>5.1} 绘制{draws:>6.1} | 脏矩形 {dirty} | 离屏churn 池{pool_mb_s:>4.0}/empty{empty_mb_s:>4.0} MB/s | 常驻 {res_mb}MB | 缓存命中 {ch}/{}({hit_pct}%) 省下载 {cache_mb}MB",
                     ch + cm
                 );
             }
@@ -1219,6 +1275,10 @@ pub fn desktop_main() -> anyhow::Result<()> {
     });
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
+    // 渲染快路径(ruffle-fork 里全部默认关、与上游一致;这里一次性全开),随后 init_from_env
+    // 读环境变量做单项覆盖(MOLE_XFORM_64K / MOLE_CAB_BLIT / ... =0 关),用于对照和紧急回退。
+    // 必须早于创建渲染后端(变换缓冲的容量在那时定下)。
+    ruffle_render::evict::set_fast_paths(true);
     // 纹理逐出开关:读 MOLE_TEXTURE_EVICT(Phase 1 不设=保持关=行为同现状)。
     ruffle_render::evict::init_from_env();
     apply_pool_budget();
@@ -1253,6 +1313,7 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
         )
         .try_init();
 
+    ruffle_render::evict::set_fast_paths(true);
     ruffle_render::evict::init_from_env();
     apply_pool_budget();
     let srv = mole::server::selected();

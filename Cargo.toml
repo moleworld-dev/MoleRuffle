@@ -61,9 +61,11 @@ opt-level = 3
 
 # ───────────────────────────────────────────────────────────────────────────
 # wgpu-core 本地补丁(vendor/wgpu-core = 官方 27.0.3 + MoleRuffle 改动,搜 "MoleRuffle:")。
-# 改动:Metal 单命令缓冲快路径 —— 渲染通道不再各开 2 个 MTLCommandBuffer(其中 Pre Pass 在 Metal 上
+# 改动 1:Metal 单命令缓冲快路径 —— 渲染通道不再各开 2 个 MTLCommandBuffer(其中 Pre Pass 在 Metal 上
 # 恒为空)。运行时开关 MOLE_METAL_SINGLE_CB=1 才启用,关掉即与官方逐行为一致。
-# 升级 wgpu 时:重新拷贝新版本源码,把 src/command/render.rs 与 memory_init.rs 里的三处改动搬过去。
+# 改动 2:只读观测计数器 wgpu_core::mole_stats(每帧渲染通道 / 拷贝段 / 绘制数),给 [perf] 行用。
+# 升级 wgpu 时:重新拷贝新版本源码,把 src/lib.rs(mole_stats)、src/command/{mod,render,memory_init}.rs
+# 里带 "MoleRuffle:" 标记的改动搬过去。
 # 回退:删掉这一段 + vendor/wgpu-core,`cargo build` 即回到官方 crate。
 # ───────────────────────────────────────────────────────────────────────────
 [patch.crates-io]
