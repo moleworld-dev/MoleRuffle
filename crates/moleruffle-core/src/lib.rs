@@ -20,18 +20,18 @@ use ruffle_core::backend::ui::{
 use ruffle_core::config::Letterbox;
 use ruffle_core::font::{DefaultFont, FontFileData, FontQuery};
 use ruffle_core::{LoadBehavior, Player, PlayerBuilder, StageScaleMode};
-use ruffle_render::quality::StageQuality;
 use ruffle_frontend_utils::backends::navigator::NavigatorInterface;
 use ruffle_frontend_utils::backends::storage::DiskStorageBackend;
+use ruffle_render::quality::StageQuality;
 use unic_langid::LanguageIdentifier;
 use url::Url;
 
 pub mod cache;
-pub use cache::{cache_dir, CachingNavigator, PENDING_BIG_LOAD_TRIM};
+pub use cache::{CachingNavigator, PENDING_BIG_LOAD_TRIM, cache_dir};
 pub mod mem;
 pub mod server;
 pub mod workers;
-pub use server::{base_url as game_base_url, swf_url as game_swf_url, ServerConfig};
+pub use server::{ServerConfig, base_url as game_base_url, swf_url as game_swf_url};
 
 /// 固定舞台尺寸(Client.swf 的逻辑尺寸)。
 pub const STAGE_WIDTH: u32 = 960;
@@ -71,34 +71,100 @@ pub fn default_stage_quality() -> StageQuality {
     }
 }
 
+/// 进程级环境初始化:先读开关文件,再给各项开关设默认值(已经设了的不覆盖)。
+///
+/// ★必须在进程里还只有一个线程时调用★(平台壳 `desktop_main` / `android_main` 的第一行):
+/// `set_var` 与其它线程同时读环境变量(C 的 getenv)是未定义行为,而一进入事件循环,
+/// tokio 运行时、缓存清理线程、音频线程、Metal 线程都已经在跑。多次调用只有第一次生效。
+///
+/// 开关文件 `flags.txt`(每行 `KEY=值`,`#` 开头为注释),按顺序找:
+///   1. `<文稿目录>/flags.txt` —— iOS 上就是 App 的"文稿"目录,Info.plist 打开了文件共享,
+///      用户能在"文件"App →"我的 iPhone"→ MoleRuffle 里放进去;
+///   2. `<数据目录>/MoleRuffle/flags.txt` —— 桌面(mac 为 ~/Library/Application Support/MoleRuffle)。
+/// 移动端设不了环境变量,这是现场关掉某项新功能(例如 `MOLE_DIRTY_RECT=0`、`MOLE_METAL_SINGLE_CB=0`)
+/// 的唯一办法。真正的环境变量优先于文件。
+pub fn init_process_env() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        load_flags_file();
+        // ★家园/场景灰屏根治(#1010 族,ABC-A1):被加载 SWF(如家园默认背景 160030.swf)主时间轴
+        // 第1帧的嵌套多帧 MovieClip(mc2/door_mc)与命名按钮 btn,在 Ruffle 单趟 construct_frame 里
+        // 不被构造 → 游戏加载回调访问 goodsMC.mc2.getChildAt(0) / owner.parent["btn"] 拿到 undefined
+        // → #1010/#1009 → 家园背景初始化夭折灰屏。启用 fork 里已实现的 eager-construct 递归补齐
+        // (loader.rs:2112 门控 + :2421 递归):只【补上】Flash 派发 complete 前本就会做的构造,从不
+        // 删改重排(loader.rs:2101-2104),且只对调用本函数的摩尔庄园路径生效(摩尔勇士 hero.61.com
+        // 不调此函数,拿逐字节上游行为,隔离成立)。live 读 env,启动期设置立即生效。
+        set_default("MOLE_LOADER_EAGER_CONSTRUCT", "1");
+        // 影片背景色生效前用黑色清屏(fork 默认白色):iOS 启动屏是黑的,等 Client.swf 那几秒
+        // 整屏闪白很刺眼。影片自己的背景色一旦生效照常使用。见 ruffle-fork player.rs。
+        set_default("MOLE_DEFAULT_BG_BLACK", "1");
+        // ★Metal 单命令缓冲(vendor/wgpu-core 补丁,见根 Cargo.toml 的 [patch.crates-io])★:
+        // 官方 wgpu-core 给每个渲染通道开 2 个 MTLCommandBuffer(其中 "Pre Pass" 在 Metal 上恒为空),
+        // 通道之间的每段上传拷贝再开 1 个。摩尔庄园一帧几十个通道(每个发光滤镜 2×quality+1 个),
+        // 命令缓冲的创建/提交占了渲染主线程的一多半。补丁让通道续写进同一个命令缓冲,渲染命令与顺序不变。
+        // 实测桌面登录页 render() 6.4ms → 2.7ms(desktop/perf-ab.sh 交替三轮)。只对 Metal 生效,其它后端
+        // 走原路径;紧急回退:启动前设 MOLE_METAL_SINGLE_CB=0。开关在第一个渲染通道时读取一次,必须早于首帧。
+        set_default("MOLE_METAL_SINGLE_CB", "1");
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        set_default("MOLE_LETTERBOX_FORCED_ALIGN", "1");
+    });
+}
+
+/// 环境变量没设时才设(开关文件和外部环境变量优先)。只在 `init_process_env` 里调用。
+fn set_default(key: &str, value: &str) {
+    if std::env::var_os(key).is_none() {
+        // SAFETY: 只在 init_process_env 里调用,调用方保证此时进程只有一个线程。
+        unsafe { std::env::set_var(key, value) };
+    }
+}
+
+/// 读 `flags.txt`(见 `init_process_env`)。
+fn load_flags_file() {
+    let candidates = [
+        dirs::document_dir().map(|d| d.join("flags.txt")),
+        dirs::data_local_dir().map(|d| d.join("MoleRuffle").join("flags.txt")),
+    ];
+    for path in candidates.into_iter().flatten() {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let mut applied = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, value)) = line.split_once('=') else {
+                continue;
+            };
+            let (key, value) = (key.trim(), value.trim());
+            if key.is_empty() || key.contains('\0') || value.contains('\0') {
+                continue;
+            }
+            if std::env::var_os(key).is_none() {
+                // SAFETY: 同 set_default。
+                unsafe { std::env::set_var(key, value) };
+                applied.push(format!("{key}={value}"));
+            }
+        }
+        // 日志系统此时可能还没初始化,先放进全局,初始化后由壳层打印。
+        FLAGS_APPLIED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(format!("{}: {}", path.display(), applied.join(" ")));
+    }
+}
+
+/// 开关文件里实际生效的项(供壳层在日志初始化后打印)。
+pub static FLAGS_APPLIED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// 把一个全新的 `PlayerBuilder` 配成“摩尔庄园专用”。
 ///
 /// 这是五端共享的关键装配:平台壳层先 `with_renderer/with_audio/with_navigator`,
 /// 再调本函数补齐摩尔庄园需要的设置(尤其是 spoof,缺了它进不去游戏)。
 pub fn apply_mole_settings(builder: PlayerBuilder) -> PlayerBuilder {
-    // ★家园/场景灰屏根治(#1010 族,ABC-A1):被加载 SWF(如家园默认背景 160030.swf)主时间轴
-    // 第1帧的嵌套多帧 MovieClip(mc2/door_mc)与命名按钮 btn,在 Ruffle 单趟 construct_frame 里
-    // 不被构造 → 游戏加载回调访问 goodsMC.mc2.getChildAt(0) / owner.parent["btn"] 拿到 undefined
-    // → #1010/#1009 → 家园背景初始化夭折灰屏。启用 fork 里已实现的 eager-construct 递归补齐
-    // (loader.rs:2112 门控 + :2421 递归):只【补上】Flash 派发 complete 前本就会做的构造,从不
-    // 删改重排(loader.rs:2101-2104),且只对调用本函数的摩尔庄园路径生效(摩尔勇士 hero.61.com
-    // 不调此函数,拿逐字节上游行为,隔离成立)。live 读 env,启动期 set_var 立即生效。
-    // SAFETY: 本函数在客户端启动期(SWF 加载前)单线程调用一次,无并发 env 读写竞争。
-    unsafe { std::env::set_var("MOLE_LOADER_EAGER_CONSTRUCT", "1"); }
-    // 影片背景色生效前用黑色清屏(fork 默认白色):iOS 启动屏是黑的,等 Client.swf 那几秒
-    // 整屏闪白很刺眼。影片自己的背景色一旦生效照常使用。见 ruffle-fork player.rs。
-    // SAFETY: 同上,启动期单线程调用。
-    unsafe { std::env::set_var("MOLE_DEFAULT_BG_BLACK", "1"); }
-    // ★Metal 单命令缓冲(vendor/wgpu-core 补丁,见根 Cargo.toml 的 [patch.crates-io])★:
-    // 官方 wgpu-core 给每个渲染通道开 2 个 MTLCommandBuffer(其中 "Pre Pass" 在 Metal 上恒为空),
-    // 通道之间的每段上传拷贝再开 1 个。摩尔庄园一帧几十个通道(每个发光滤镜 2×quality+1 个),
-    // 命令缓冲的创建/提交占了渲染主线程的一多半。补丁让通道续写进同一个命令缓冲,渲染命令与顺序不变。
-    // 实测桌面登录页 render() 6.4ms → 2.7ms(desktop/perf-ab.sh 交替三轮)。只对 Metal 生效,其它后端
-    // 走原路径;紧急回退:启动前设 MOLE_METAL_SINGLE_CB=0。开关在第一个渲染通道时读取一次,必须早于首帧。
-    // SAFETY: 同上,启动期单线程调用。
-    if std::env::var_os("MOLE_METAL_SINGLE_CB").is_none() {
-        unsafe { std::env::set_var("MOLE_METAL_SINGLE_CB", "1"); }
-    }
+    // 进程级环境变量(各项开关的默认值、开关文件)。正常情况下平台壳已在进程最开头调过,这里是兜底。
+    init_process_env();
 
     // 画质/MSAA:见 default_stage_quality(iOS 1x,桌面 High8x8)。
     let quality = default_stage_quality();
@@ -110,12 +176,9 @@ pub fn apply_mole_settings(builder: PlayerBuilder) -> PlayerBuilder {
     //   强制(force)防止 SWF 自己改 stage.align 把它挪回去。桌面窗口没有手柄,保持居中。
     //   ★配套★:上游只在对齐为空时画黑边,强制贴顶会让黑边消失、两侧露出白色舞台背景和舞台外
     //   内容(实测 iPhone 两侧白边)。MOLE_LETTERBOX_FORCED_ALIGN 让 fork 在宿主强制对齐时照样画黑边。
+    //   (MOLE_LETTERBOX_FORCED_ALIGN 在 init_process_env 里设置。)
     #[cfg(any(target_os = "ios", target_os = "android"))]
-    let builder = {
-        // SAFETY: 同上,启动期单线程调用。
-        unsafe { std::env::set_var("MOLE_LETTERBOX_FORCED_ALIGN", "1"); }
-        builder.with_align(ruffle_core::StageAlign::TOP, true)
-    };
+    let builder = builder.with_align(ruffle_core::StageAlign::TOP, true);
 
     builder
         .with_autoplay(true)
@@ -139,7 +202,11 @@ pub fn apply_mole_settings(builder: PlayerBuilder) -> PlayerBuilder {
         // 实验开关:MOLE_FPS=60 强制覆盖 SWF 的 24fps(用来测摩尔庄园是"帧基"还是"时间基")。
         // 默认(未设/解析失败)= None → 用 SWF 自带 24fps,零影响。帧基游戏提帧率会整体加速,
         // 时间基则只变顺不变快。forced_frame_rate 由 with_frame_rate(Some) 自动置真、覆盖 SWF 头。
-        .with_frame_rate(std::env::var("MOLE_FPS").ok().and_then(|s| s.parse::<f64>().ok()))
+        .with_frame_rate(
+            std::env::var("MOLE_FPS")
+                .ok()
+                .and_then(|s| s.parse::<f64>().ok()),
+        )
 }
 
 /// 摩尔庄园本地存储(Flash `SharedObject` / `.sol`)的磁盘根目录。
@@ -195,9 +262,9 @@ pub fn set_mole_fonts(player: &mut Player) {
     player.set_default_font(
         DefaultFont::Sans,
         vec![
-            "PingFang SC".into(),       // macOS / iOS
-            "Microsoft YaHei".into(),   // Windows
-            "Noto Sans CJK SC".into(),  // Linux / Android
+            "PingFang SC".into(),      // macOS / iOS
+            "Microsoft YaHei".into(),  // Windows
+            "Noto Sans CJK SC".into(), // Linux / Android
             "Source Han Sans SC".into(),
             "Heiti SC".into(),
             "Arial".into(),
@@ -288,9 +355,9 @@ fn mole_cjk_device_fonts() -> bool {
 /// 设备字体回退顺序:任何字体名都先试精确匹配,失败再依次退到这些
 /// “一定带中文”的字体,保证摩尔庄园的动态文本(玩家名/聊天/系统提示)能显示中文。
 const FONT_FALLBACKS: &[&str] = &[
-    "PingFang SC",       // macOS / iOS
-    "Microsoft YaHei",   // Windows
-    "Noto Sans CJK SC",  // Linux / Android
+    "PingFang SC",      // macOS / iOS
+    "Microsoft YaHei",  // Windows
+    "Noto Sans CJK SC", // Linux / Android
     "Source Han Sans SC",
     "Heiti SC",
     "STHeiti",
@@ -494,7 +561,11 @@ impl UiBackend for MoleUiBackend {
         // 置个标志,由平台壳退避后重新发起(见 ROOT_LOAD_FAILED)。
         tracing::warn!(
             "主 SWF 加载失败({}): {fetch_error}",
-            if invalid_swf { "内容无效" } else { "下载失败" }
+            if invalid_swf {
+                "内容无效"
+            } else {
+                "下载失败"
+            }
         );
         ROOT_LOAD_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -517,7 +588,10 @@ impl UiBackend for MoleUiBackend {
     fn language(&self) -> LanguageIdentifier {
         "zh-CN".parse().expect("合法 language id")
     }
-    fn display_file_open_dialog(&mut self, _filters: Vec<FileFilter>) -> Option<DialogResultFuture> {
+    fn display_file_open_dialog(
+        &mut self,
+        _filters: Vec<FileFilter>,
+    ) -> Option<DialogResultFuture> {
         None
     }
     fn display_file_open_dialog_multiple(
@@ -540,8 +614,8 @@ impl UiBackend for MoleUiBackend {
 /// `clipboard_content` 优先返回它,从而绕过 iOS16+ 对程序化读剪贴板的隐私拦截(不弹窗)。
 #[cfg(target_os = "ios")]
 pub mod paste_bridge {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     static BUF: Mutex<Option<String>> = Mutex::new(None);
     static PENDING: AtomicBool = AtomicBool::new(false);

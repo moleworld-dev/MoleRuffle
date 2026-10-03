@@ -50,5 +50,10 @@
         <key>NSAllowsArbitraryLoads</key>
         <true/>
     </dict>
+	<!-- 文件共享:让"文件"App/访达能看到 App 的"文稿"目录,用户可以放 flags.txt(运行时开关,见 moleruffle-core 的 init_process_env)。 -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 </dict>
 </plist>

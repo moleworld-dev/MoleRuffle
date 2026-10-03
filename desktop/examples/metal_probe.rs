@@ -107,7 +107,11 @@ fn main() {
     // 画几帧:每帧一个通道,用第一条管线
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: None,
-        size: wgpu::Extent3d { width: 256, height: 256, depth_or_array_layers: 1 },
+        size: wgpu::Extent3d {
+            width: 256,
+            height: 256,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
@@ -125,7 +129,10 @@ fn main() {
     let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &layout,
-        entries: &[wgpu::BindGroupEntry { binding: 0, resource: buffer.as_entire_binding() }],
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }],
     });
     let mut draw_with = |range: std::ops::Range<usize>, label: &str| {
         for _ in 0..4 {
@@ -151,7 +158,10 @@ fn main() {
                 }
             }
             queue.submit([encoder.finish()]);
-            let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            let _ = device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
         }
         blocks(label);
     };
