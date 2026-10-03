@@ -329,6 +329,54 @@ impl App {
         // 渲染尺寸用 render_dims(iOS 已 ×RENDER_SCALE 降采样,省显存避免 jetsam)
         let (width, height) = render_dims(&window);
 
+        // ★启动关键路径并行化★:最先建导航器并立即预取主 SWF(连 DNS 一起),再去建渲染器
+        // (冷缓存时着色器编译约 0.5 秒)、扫字体库、初始化音频。原先这些全做完、build_player 返回后
+        // 事件循环第一次轮询时请求才发出;白屏的主体是网络等待(剖析:主线程只忙 6~12%)。
+        // 引擎稍后请求同一 URL 时由缓存层直接接手(见 CachingNavigator::prefetch)。
+        // 音频:后端内部有不能跨线程的回调,只能在主线程建;这里先在后台线程把系统音频层预热
+        // (查一次默认输出设备与配置,CoreAudio HAL 初始化实测 9~86ms),主线程稍后再建就快了。
+        let _ = std::thread::Builder::new()
+            .name("mole-audio-warm".into())
+            .spawn(|| {
+                use cpal::traits::{DeviceTrait, HostTrait};
+                let started = Instant::now();
+                if let Some(device) = cpal::default_host().default_output_device() {
+                    let _ = device.default_output_config();
+                }
+                tracing::debug!("音频预热 {}ms", started.elapsed().as_millis());
+            });
+        let content = Rc::new(PlayingContent::DirectFile(ContentDescriptor::new_remote(
+            mole::game_swf_url(),
+        )));
+
+        let navigator = ExternalNavigatorBackend::new(
+            mole::game_base_url(),
+            None,
+            None,
+            MoleExecutor {
+                proxy: self.proxy.clone(),
+            },
+            None,
+            false,
+            HashSet::new(),
+            SocketMode::Allow, // 等价桌面版 --tcp-connections allow
+            content,
+            mole::MoleNavigatorInterface,
+        );
+        // ★ 本地资源缓存(CDN 思路):静态资源 SWF/图片缓存到磁盘,二次加载秒开且免网络,
+        //   缓解 mole.61.com 慢/抖动导致的"维护"与每次重下。socket/登录动态请求不走缓存。
+        let navigator = mole::CachingNavigator::new(navigator, mole::cache_dir());
+
+        if std::env::var("MOLE_PREFETCH").as_deref() != Ok("0") {
+            navigator.prefetch(mole::server::selected().swf_url);
+            // 版本清单:主 SWF 加载后第一件事就是请求它(带每次随机的防缓存串,服务器忽略该串),
+            // 两者原本串行、各自都可能卡几秒;同时预取把等待从相加变成取最大值。
+            navigator.prefetch_ignoring_query(&format!(
+                "{}version/zzz_config.txt",
+                mole::game_base_url()
+            ));
+        }
+
         // 自建 wgpu device(复刻 ruffle for_window_unsafe + request_device,只改两处省内存):
         //   ① memory_hints: MemoryUsage —— 让 Metal 分配器更紧凑,省 ~150-400MB 冗余(默认 Performance 偏大块预分配);
         //   ② max_texture_dimension_2d 封顶 4096 —— 摩尔庄园源美术仅 960×560,足够;挡病态超大纹理分配。
@@ -425,28 +473,6 @@ impl App {
             (backend, render_api)
         };
 
-        let content = Rc::new(PlayingContent::DirectFile(ContentDescriptor::new_remote(
-            mole::game_swf_url(),
-        )));
-
-        let navigator = ExternalNavigatorBackend::new(
-            mole::game_base_url(),
-            None,
-            None,
-            MoleExecutor {
-                proxy: self.proxy.clone(),
-            },
-            None,
-            false,
-            HashSet::new(),
-            SocketMode::Allow, // 等价桌面版 --tcp-connections allow
-            content,
-            mole::MoleNavigatorInterface,
-        );
-        // ★ 本地资源缓存(CDN 思路):静态资源 SWF/图片缓存到磁盘,二次加载秒开且免网络,
-        //   缓解 mole.61.com 慢/抖动导致的"维护"与每次重下。socket/登录动态请求不走缓存。
-        let navigator = mole::CachingNavigator::new(navigator, mole::cache_dir());
-
         // 设备字体后端:系统字体 + 中文回退;并取软键盘标志(文本框聚焦时弹键盘)
         let ui = mole::MoleUiBackend::with_system_fonts();
         let kbd = ui.keyboard_flag();
@@ -507,7 +533,11 @@ impl App {
         let per_frame = |i: usize| gpu_now[i].saturating_sub(gpu_last[i]) as f64 / n;
         let (passes, segments, draws) = (per_frame(0), per_frame(1), per_frame(2));
         // Metal 单命令缓冲快路径覆盖的通道占比(非 Metal 后端恒为 0)。
-        let fast_pct = if passes > 0.0 { per_frame(3) / passes * 100.0 } else { 0.0 };
+        let fast_pct = if passes > 0.0 {
+            per_frame(3) / passes * 100.0
+        } else {
+            0.0
+        };
         self.perf_gpu_last = gpu_now;
 
         let mut kinds = [0.0f64; ruffle_render::evict::PASS_KIND_COUNT];

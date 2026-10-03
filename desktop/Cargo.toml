@@ -34,6 +34,8 @@ raw-window-handle.workspace = true
 futures.workspace = true
 async-task.workspace = true
 tokio.workspace = true
+# 后台线程预热系统音频层(与 ruffle_frontend_utils 用的同一版本)。
+cpal = "0.16"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
