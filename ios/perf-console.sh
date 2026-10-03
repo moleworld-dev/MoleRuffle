@@ -14,7 +14,7 @@ summary() {
 import re, sys, statistics as st
 rows = []
 for line in open(sys.argv[1], errors="replace"):
-    m = re.search(r"\[perf\] FPS\s+(\d+) \| render 均\s*([\d.]+)/峰\s*([\d.]+)ms \| 每帧 通道\s*([\d.]+)\((.*?)\) 拷贝段\s*([\d.]+) 绘制\s*([\d.]+) \| 脏矩形 (.*?) \| 烘焙 (.*?)(?: \||$)", line)
+    m = re.search(r"\[perf\] FPS\s+(\d+) \| render 均\s*([\d.]+)/峰\s*([\d.]+)ms \| 每帧 通道\s*([\d.]+)\((.*?)\) 拷贝段\s*([\d.]+) 绘制\s*([\d.]+)(?: 快路径\s*[\d.]+%)? \| 脏矩形 (.*?) \| 烘焙 (.*?)(?: \||$)", line)
     if m:
         rows.append(m.groups())
 if not rows:

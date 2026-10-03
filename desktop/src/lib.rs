@@ -123,7 +123,7 @@ struct App {
     perf_render_n: u32,
     perf_render_max_us: u128,
     /// [perf] 上次取样时 wgpu-core 观测计数器的累计值(通道 / 拷贝段 / 绘制),取差值算每帧数量。
-    perf_gpu_last: [usize; 3],
+    perf_gpu_last: [usize; 4],
     /// [perf] 上次取样时各来源通道数的累计值(下标见 ruffle_render::evict::PassKind)。
     perf_kind_last: [usize; ruffle_render::evict::PASS_KIND_COUNT],
     /// [perf] 上次取样时脏矩形统计的累计值(见 ruffle_render::evict::DIRTY_STATS)。
@@ -308,7 +308,7 @@ impl App {
             perf_render_sum_us: 0,
             perf_render_n: 0,
             perf_render_max_us: 0,
-            perf_gpu_last: [0; 3],
+            perf_gpu_last: [0; 4],
             perf_kind_last: [0; ruffle_render::evict::PASS_KIND_COUNT],
             perf_dirty_last: [0; 7],
             perf_memo_last: [0; 4],
@@ -493,14 +493,19 @@ impl App {
         let n = self.perf_render_n.max(1) as f64;
         let render_ms = self.perf_render_sum_us as f64 / 1000.0 / n;
         let render_max_ms = self.perf_render_max_us as f64 / 1000.0;
+        // 经 wgpu 的重导出(wgpu::wgc)读 vendor/wgpu-core 的计数器:保证读的就是 wgpu 实际用的那份
+        // wgpu-core。升级 wgpu 而忘了更新 vendor 时这里会编译失败,而不是补丁静默失效(审查指出)。
         let gpu_now = [
-            wgpu_core::mole_stats::RENDER_PASSES.load(Relaxed),
-            wgpu_core::mole_stats::COPY_SEGMENTS.load(Relaxed),
-            wgpu_core::mole_stats::DRAWS.load(Relaxed),
+            wgpu::wgc::mole_stats::RENDER_PASSES.load(Relaxed),
+            wgpu::wgc::mole_stats::COPY_SEGMENTS.load(Relaxed),
+            wgpu::wgc::mole_stats::DRAWS.load(Relaxed),
+            wgpu::wgc::mole_stats::FAST_PASSES.load(Relaxed),
         ];
         let gpu_last = self.perf_gpu_last;
         let per_frame = |i: usize| gpu_now[i].saturating_sub(gpu_last[i]) as f64 / n;
         let (passes, segments, draws) = (per_frame(0), per_frame(1), per_frame(2));
+        // Metal 单命令缓冲快路径覆盖的通道占比(非 Metal 后端恒为 0)。
+        let fast_pct = if passes > 0.0 { per_frame(3) / passes * 100.0 } else { 0.0 };
         self.perf_gpu_last = gpu_now;
 
         let mut kinds = [0.0f64; ruffle_render::evict::PASS_KIND_COUNT];
@@ -554,7 +559,7 @@ impl App {
         self.perf_render_n = 0;
         self.perf_render_max_us = 0;
         format!(
-            "render 均{render_ms:>5.2}/峰{render_max_ms:>5.2}ms | 每帧 通道{passes:>5.1}({kinds}) 拷贝段{segments:>5.1} 绘制{draws:>6.1} | 脏矩形 {dirty} | 烘焙 {memo}"
+            "render 均{render_ms:>5.2}/峰{render_max_ms:>5.2}ms | 每帧 通道{passes:>5.1}({kinds}) 拷贝段{segments:>5.1} 绘制{draws:>6.1} 快路径{fast_pct:>3.0}% | 脏矩形 {dirty} | 烘焙 {memo}"
         )
     }
 
