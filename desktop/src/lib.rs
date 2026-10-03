@@ -397,7 +397,17 @@ impl App {
             let descriptors = Descriptors::new(instance, adapter, device, queue);
             let target =
                 SwapChainTarget::new(surface, &descriptors.adapter, (width, height), &descriptors.device);
-            let backend = WgpuRenderBackend::new(std::sync::Arc::new(descriptors), target)
+            let descriptors = std::sync::Arc::new(descriptors);
+            // 后台预建滤镜/离屏表面的渲染管线(ruffle-fork descriptors.rs)。不预建的话它们在登录页
+            // 首次出现发光/模糊时在主线程上编译,卡 100~170ms;现在主 SWF 还在下载,正好空闲。
+            // MOLE_PREWARM=0 关掉(对照用)。
+            if std::env::var("MOLE_PREWARM").as_deref() != Ok("0") {
+                let _ = ruffle_render_wgpu::descriptors::spawn_pipeline_prewarm(
+                    descriptors.clone(),
+                    mole::default_stage_quality(),
+                );
+            }
+            let backend = WgpuRenderBackend::new(descriptors, target)
                 .expect("创建 wgpu 渲染后端失败");
             (backend, render_api)
         };
