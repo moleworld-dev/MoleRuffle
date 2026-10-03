@@ -44,8 +44,14 @@ XCENT=$(find "$DD" -name "moleruffle.app.xcent" 2>/dev/null | head -1)
 codesign --force --sign "$IDENTITY" ${XCENT:+--entitlements "$XCENT"} --generate-entitlement-der "$APP"
 codesign --verify --verbose "$APP" || { echo "签名校验失败"; exit 1; }
 
-echo "== 4. 安装到真机 =="
-xcrun devicectl device install app --device "$DEV" "$APP"
+# 安装/启动用的 devicectl:手机系统比正式版 Xcode 新时(例如 iOS 27.2 测试版),正式版挂不上它的
+# 开发者磁盘映像,安装会报 "Connection interrupted"(3002)。有测试版 Xcode 就用它的 devicectl;
+# 这只影响和设备通信,二进制仍是上面用正式版 SDK 编的(见 ios/_env.sh)。
+DEVCTL_DIR="$DEVELOPER_DIR"
+[[ -d /Applications/Xcode-beta.app/Contents/Developer ]] && DEVCTL_DIR=/Applications/Xcode-beta.app/Contents/Developer
+
+echo "== 4. 安装到真机(devicectl 来自 $DEVCTL_DIR)=="
+DEVELOPER_DIR="$DEVCTL_DIR" xcrun devicectl device install app --device "$DEV" "$APP"
 
 echo "== 5. 启动(需先解锁手机)=="
-xcrun devicectl device process launch --device "$DEV" --terminate-existing com.moleworld.moleruffle
+DEVELOPER_DIR="$DEVCTL_DIR" xcrun devicectl device process launch --device "$DEV" --terminate-existing com.moleworld.moleruffle
