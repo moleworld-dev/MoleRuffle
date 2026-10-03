@@ -47,6 +47,30 @@ pub fn window_title() -> String {
     }
 }
 
+/// 本客户端的默认画质(决定 MSAA 采样数)。`apply_mole_settings` 用它配播放器,平台壳用它
+/// 让渲染后端提前在后台编好对应采样数的管线。
+///
+/// iOS 真机关 MSAA(Low=1x)。Apple GPU 最大 4x MSAA,High8x8 在真机被钳到 4x、
+/// 仍要按全屏物理像素(~2868×1320)分配 ~90MB+ MSAA framebuffer,且乘进每个滤镜/cacheAsBitmap
+/// 离屏目标 → 进游戏世界叠纹理超 iOS jetsam 内存上限被 SIGKILL(实测真机闪退)。关 MSAA + 壳层
+/// render_scale 降采样后显存大降。摩尔庄园源美术仅 960×560,关 MSAA 视觉几乎无感。桌面窗口小,
+/// 保留 High8x8 高画质。
+/// 实验开关:MOLE_QUALITY=low|medium|high|high8x8 运行时选画质/MSAA(测 MSAA 对高帧率 GPU 成本)。
+/// 未设=各端默认。采样数:low=1x medium=2x high=4x high8x8=8x(Metal 钳 4x)。
+pub fn default_stage_quality() -> StageQuality {
+    #[cfg(target_os = "ios")]
+    let default_quality = StageQuality::Low;
+    #[cfg(not(target_os = "ios"))]
+    let default_quality = StageQuality::High8x8;
+    match std::env::var("MOLE_QUALITY").as_deref() {
+        Ok("low") => StageQuality::Low,
+        Ok("medium") => StageQuality::Medium,
+        Ok("high") => StageQuality::High,
+        Ok("high8x8") => StageQuality::High8x8,
+        _ => default_quality,
+    }
+}
+
 /// 把一个全新的 `PlayerBuilder` 配成“摩尔庄园专用”。
 ///
 /// 这是五端共享的关键装配:平台壳层先 `with_renderer/with_audio/with_navigator`,
@@ -76,24 +100,8 @@ pub fn apply_mole_settings(builder: PlayerBuilder) -> PlayerBuilder {
         unsafe { std::env::set_var("MOLE_METAL_SINGLE_CB", "1"); }
     }
 
-    // 画质/MSAA:iOS 真机关 MSAA(Low=1x)。Apple GPU 最大 4x MSAA,High8x8 在真机被钳到 4x、
-    // 仍要按全屏物理像素(~2868×1320)分配 ~90MB+ MSAA framebuffer,且乘进每个滤镜/cacheAsBitmap
-    // 离屏目标 → 进游戏世界叠纹理超 iOS jetsam 内存上限被 SIGKILL(实测真机闪退)。关 MSAA + 壳层
-    // render_scale 降采样后显存大降。摩尔庄园源美术仅 960×560,关 MSAA 视觉几乎无感。桌面窗口小,
-    // 保留 High8x8 高画质。
-    #[cfg(target_os = "ios")]
-    let default_quality = StageQuality::Low;
-    #[cfg(not(target_os = "ios"))]
-    let default_quality = StageQuality::High8x8;
-    // 实验开关:MOLE_QUALITY=low|medium|high|high8x8 运行时选画质/MSAA(测 MSAA 对高帧率 GPU 成本)。
-    // 未设=各端默认。采样数:low=1x medium=2x high=4x high8x8=8x(Metal 钳 4x)。
-    let quality = match std::env::var("MOLE_QUALITY").as_deref() {
-        Ok("low") => StageQuality::Low,
-        Ok("medium") => StageQuality::Medium,
-        Ok("high") => StageQuality::High,
-        Ok("high8x8") => StageQuality::High8x8,
-        _ => default_quality,
-    };
+    // 画质/MSAA:见 default_stage_quality(iOS 1x,桌面 High8x8)。
+    let quality = default_stage_quality();
     // ★舞台贴顶(仅移动端)★:折叠屏展开 / iPad 这类比舞台 960:560 更"方"的屏幕上,
     //   ShowAll 默认把游戏垂直居中,上下各留一条窄黑边,虚拟手柄只能压在游戏上。贴顶后
     //   两条窄边合成底部一整条,手柄放进去完全不挡画面(见 desktop/src/pad_layout.rs)。
