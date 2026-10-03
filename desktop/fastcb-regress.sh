@@ -2,7 +2,7 @@
 # 用 ruffle-fork 自带的图像回归(tests 的 visual 目录)验证 MoleRuffle 的渲染改动。
 #
 # fork 自己的测试用的是官方 wgpu-core,覆盖不到 vendor/wgpu-core 的补丁;这里用 cargo 的 --config
-# 临时把 fork 的 wgpu-core 换成 MoleRuffle/vendor/wgpu-core(不改任何文件,Cargo.lock 结束后还原),
+# 临时把 fork 的 wgpu-core / wgpu-hal 换成 MoleRuffle/vendor 里的补丁版(不改任何文件,Cargo.lock 结束后还原),
 # 并用 MOLE_FAST_PATHS=1 打开 fork 里全部渲染快路径,分三轮跑:
 #   基线  :官方 wgpu-core + 快路径全关(上游行为)
 #   补丁关:补丁版 wgpu-core + 快路径全开 + MOLE_METAL_SINGLE_CB=0
@@ -26,7 +26,8 @@ run() {
   local tag=$1; shift
   local patch=$1; shift
   local args=(test -p tests --features imgtests --test tests)
-  [[ $patch == 1 ]] && args=(--config "patch.crates-io.wgpu-core.path=\"$HERE/vendor/wgpu-core\"" "${args[@]}")
+  [[ $patch == 1 ]] && args=(--config "patch.crates-io.wgpu-core.path=\"$HERE/vendor/wgpu-core\"" \
+    --config "patch.crates-io.wgpu-hal.path=\"$HERE/vendor/wgpu-hal\"" "${args[@]}")
   echo "== $tag"
   env "$@" cargo "${args[@]}" -- "$FILTER" >"$OUT/$tag.log" 2>&1
   grep -E "^test result" "$OUT/$tag.log" | tail -1

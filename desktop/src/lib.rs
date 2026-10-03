@@ -413,9 +413,11 @@ impl App {
             // 首次出现发光/模糊时在主线程上编译,卡 100~170ms;现在主 SWF 还在下载,正好空闲。
             // MOLE_PREWARM=0 关掉(对照用)。
             if std::env::var("MOLE_PREWARM").as_deref() != Ok("0") {
+                use ruffle_render_wgpu::target::RenderTarget;
                 let _ = ruffle_render_wgpu::descriptors::spawn_pipeline_prewarm(
                     descriptors.clone(),
                     mole::default_stage_quality(),
+                    Some(target.format()),
                 );
             }
             let backend =
