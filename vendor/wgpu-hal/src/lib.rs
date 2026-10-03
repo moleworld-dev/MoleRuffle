@@ -263,6 +263,10 @@ pub mod noop;
 #[cfg(vulkan)]
 pub mod vulkan;
 
+/// MoleRuffle:补丁版标记。MoleRuffle 的 desktop crate 经 `wgpu::hal` 引用它:升级 wgpu 后若补丁没被
+/// 用上(依赖图里是官方 wgpu-hal),编译直接失败,而不是悄悄退回"编译期间持有设备锁"。见 MOLERUFFLE.md。
+pub const MOLERUFFLE_PATCHED_METAL_COMPILE_UNLOCKED: bool = true;
+
 pub mod auxil;
 pub mod api {
     #[cfg(dx12)]
