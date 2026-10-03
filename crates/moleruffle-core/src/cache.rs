@@ -407,8 +407,25 @@ fn write_cache_atomic(path: &PathBuf, bytes: &[u8]) {
     }
 }
 
+/// 游戏自己的统计打点 `misc.js?…&sstid=首页素材加载&item=加载成功` = 登录页素材全部到齐(游戏自己的定义)。
+fn is_home_loaded_ping(url: &str) -> bool {
+    let Some((path, query)) = url.split_once('?') else {
+        return false;
+    };
+    if !path.ends_with("misc.js") {
+        return false;
+    }
+    let pairs: Vec<_> = url::form_urlencoded::parse(query.as_bytes()).collect();
+    let has = |key: &str, value: &str| pairs.iter().any(|(k, v)| k == key && v == value);
+    has("sstid", "首页素材加载") && has("item", "加载成功")
+}
+
 impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
     fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+        // 发出请求时就记(不等统计服务器响应):桌面对照脚本 perf-ab / startup-ab 拿它当"登录页就绪"。
+        if is_home_loaded_ping(request.url()) {
+            tracing::info!("里程碑:游戏报告首页素材加载成功");
+        }
         // 接手预取:同一个绝对 URL、无请求头的 GET(引擎请求主 SWF 正是如此)。
         if request.method() == NavigationMethod::Get
             && request.body().is_none()
@@ -1003,8 +1020,23 @@ pub fn trim_cache_in_background() {
 
 #[cfg(test)]
 mod tests {
-    use super::cws_to_fws;
+    use super::{cws_to_fws, is_home_loaded_ping};
     use std::io::Write;
+
+    #[test]
+    fn home_loaded_ping() {
+        let ping = |item: &str| {
+            format!(
+                "http://newmisc.taomee.com/misc.js?gameid=1&stid=%E5%9F%BA%E6%9C%AC%E6%95%B0%E6%8D%AE&sstid=%E9%A6%96%E9%A1%B5%E7%B4%A0%E6%9D%90%E5%8A%A0%E8%BD%BD&item={item}&itemlen=36"
+            )
+        };
+        assert!(is_home_loaded_ping(&ping("%E5%8A%A0%E8%BD%BD%E6%88%90%E5%8A%9F")));
+        assert!(!is_home_loaded_ping(&ping("%E5%BC%80%E5%A7%8B%E5%8A%A0%E8%BD%BD")));
+        assert!(!is_home_loaded_ping("http://mole.61.com/Client.swf"));
+        assert!(!is_home_loaded_ping(
+            "http://x/a.swf?sstid=%E9%A6%96%E9%A1%B5%E7%B4%A0%E6%9D%90%E5%8A%A0%E8%BD%BD&item=%E5%8A%A0%E8%BD%BD%E6%88%90%E5%8A%9F"
+        ));
+    }
 
     /// 造一个最小但合法的 SWF 正文:舞台矩形 + 帧率 + 帧数 + End 标签 + 若干填充。
     fn fake_swf_body() -> Vec<u8> {

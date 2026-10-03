@@ -179,6 +179,7 @@ const FLAG_KEYS: &[&str] = &[
     "MOLE_BLEND_DEFER",
     "MOLE_CAB_BLIT",
     "MOLE_XFORM_64K",
+    "MOLE_LAZY_SHAPE",
     "MOLE_METAL_SINGLE_CB",
     "MOLE_PREWARM",
     "MOLE_PREFETCH",

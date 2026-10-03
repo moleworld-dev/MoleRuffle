@@ -7,8 +7,10 @@
 #   desktop/perf-ab.sh "基线=MOLE_METAL_SINGLE_CB=0" "单缓冲=MOLE_METAL_SINGLE_CB=1"
 #   desktop/perf-ab.sh -p profiling -s "基线=A=0" "新=A=1 B=1"      # -s:同时用 sample 采主线程
 #
-# 每组:启动 → 等 [perf] 行的"常驻"位图达到 -r 阈值(默认 18MB = 登录页全部加载完;网络慢时固定等待
-# 不可靠;45 秒没加载完就重启,最多 4 次)→ 再稳定 -w 秒 → 采样窗口 → 杀进程。只启动不点击,停在登录页(稳态 24fps)。
+# 每组:启动 → 等登录页就绪(日志出现"里程碑:游戏报告首页素材加载成功",即游戏自己的统计打点;
+# 不带这行日志的旧二进制退回看 [perf] 行"常驻"位图达到 -r 阈值,默认 18MB —— 惰性形状打开后
+# 只解码显示到的位图,常驻只有 6MB 左右,不能再用它判断。网络慢时固定等待不可靠;45 秒没加载完就
+# 重启,最多 4 次)→ 再稳定 -w 秒 → 采样窗口 → 杀进程。只启动不点击,停在登录页(稳态 24fps)。
 # 结果写到 target/perf-ab/<标签>/{log.txt,sample.txt},并打印每组 render 均值的中位数。
 set -u
 cd "$(dirname "$0")/.."
@@ -37,13 +39,14 @@ for spec in "$@"; do
     for _ in {1..22}; do
       sleep 2
       kill -0 $pid 2>/dev/null || break
+      grep -aq "里程碑:游戏报告首页素材加载成功" "$out/log.txt" && { ready=1; break; }
       mb=$(grep -a "\[perf\]" "$out/log.txt" | tail -1 | sed -nE 's/.*常驻 ([0-9]+)MB.*/\1/p')
       [[ -n $mb && $mb -ge $READY_MB ]] && { ready=1; break; }
     done
     [[ $ready == 1 ]] && break
     kill $pid 2>/dev/null; sleep 1; kill -9 $pid 2>/dev/null; sleep 1
   done
-  if [[ $ready == 0 ]]; then echo "[$tag] 重试 4 次都没加载到常驻 ${READY_MB}MB,跳过"; continue; fi
+  if [[ $ready == 0 ]]; then echo "[$tag] 重试 4 次登录页都没加载完,跳过"; continue; fi
   sleep "$WARM"
   start_line=$(wc -l <"$out/log.txt")
   if [[ $DO_SAMPLE == 1 ]]; then

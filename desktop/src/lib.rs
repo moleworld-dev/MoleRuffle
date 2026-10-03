@@ -130,6 +130,9 @@ struct App {
     perf_dirty_last: [usize; 7],
     /// [perf] 上次取样时烘焙记忆统计的累计值(见 ruffle_render::evict::CAB_MEMO_STATS)。
     perf_memo_last: [usize; 4],
+    /// [perf] 上次取样时形状细分 + 位图解码统计的累计值(见 ruffle_render::evict::SHAPE_STATS /
+    /// BITMAP_DECODE_STATS,后两项是解码)。
+    perf_shape_last: [usize; 8],
     /// iOS [perf] 行的统计窗口起点(按墙钟出行)。
     #[cfg(target_os = "ios")]
     perf_window_start: Instant,
@@ -312,6 +315,7 @@ impl App {
             perf_kind_last: [0; ruffle_render::evict::PASS_KIND_COUNT],
             perf_dirty_last: [0; 7],
             perf_memo_last: [0; 4],
+            perf_shape_last: [0; 8],
             #[cfg(target_os = "ios")]
             perf_window_start: Instant::now(),
             #[cfg(not(target_os = "ios"))]
@@ -600,11 +604,37 @@ impl App {
             memo[2] as f64 / n,
             memo[3]
         );
+        // 形状细分与位图解码(窗口内合计,突发性的,不按帧平均):定义期真细分 / 惰性跳过 + 定义期耗时,
+        // 渲染期按缩放细分 + 耗时(含其中的位图解码),库位图解码张数 + 耗时。
+        let mut shape = [0usize; 8];
+        for (i, v) in shape.iter_mut().enumerate() {
+            let now = if i < 6 {
+                ruffle_render::evict::SHAPE_STATS[i].load(Relaxed)
+            } else {
+                ruffle_render::evict::BITMAP_DECODE_STATS[i - 6].load(Relaxed)
+            };
+            *v = now.saturating_sub(self.perf_shape_last[i]);
+            self.perf_shape_last[i] = now;
+        }
+        let ms = |us: usize| us as f64 / 1000.0;
+        let mut shape_text = format!(
+            "定义 细{}/跳{} {:.1}ms 渲染细分{} {:.1}ms 解码{}张 {:.1}ms",
+            shape[0],
+            shape[1],
+            ms(shape[4]),
+            shape[2],
+            ms(shape[5]),
+            shape[6],
+            ms(shape[7])
+        );
+        if shape[3] > 0 {
+            shape_text.push_str(&format!(" ⚠自检不一致{}", shape[3]));
+        }
         self.perf_render_sum_us = 0;
         self.perf_render_n = 0;
         self.perf_render_max_us = 0;
         format!(
-            "render 均{render_ms:>5.2}/峰{render_max_ms:>5.2}ms | 每帧 通道{passes:>5.1}({kinds}) 拷贝段{segments:>5.1} 绘制{draws:>6.1} 快路径{fast_pct:>3.0}% | 脏矩形 {dirty} | 烘焙 {memo}"
+            "render 均{render_ms:>5.2}/峰{render_max_ms:>5.2}ms | 每帧 通道{passes:>5.1}({kinds}) 拷贝段{segments:>5.1} 绘制{draws:>6.1} 快路径{fast_pct:>3.0}% | 脏矩形 {dirty} | 烘焙 {memo} | 形状 {shape_text}"
         )
     }
 
