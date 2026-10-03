@@ -1324,6 +1324,7 @@ impl Global {
                 }
                 crate::mole_stats::RENDER_PASSES.fetch_add(passes, Relaxed);
                 crate::mole_stats::COPY_SEGMENTS.fetch_add(segments, Relaxed);
+                crate::mole_stats::dump_if_requested();
             }
             for command in commands.drain(..) {
                 if matches!(

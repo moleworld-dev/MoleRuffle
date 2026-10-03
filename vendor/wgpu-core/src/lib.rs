@@ -118,6 +118,25 @@ pub mod mole_stats {
     pub static DRAWS: AtomicUsize = AtomicUsize::new(0);
     /// `command_encoder_finish` 调用次数。
     pub static FINISHES: AtomicUsize = AtomicUsize::new(0);
+
+    /// 环境变量 MOLE_STATS_DUMP=1 时,每次 finish 往 stderr 打一行累计值(给没有 [perf] 行的
+    /// 图像回归测试确认"快路径确实走到了";见 MoleRuffle/desktop/fastcb-regress.sh)。
+    pub fn dump_if_requested() {
+        #[cfg(feature = "std")]
+        {
+            use core::sync::atomic::Ordering::Relaxed;
+            static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *ON.get_or_init(|| std::env::var("MOLE_STATS_DUMP").as_deref() == Ok("1")) {
+                std::eprintln!(
+                    "[mole_stats] 渲染通道 {} 其中快路径 {} 拷贝段 {} 绘制 {}",
+                    RENDER_PASSES.load(Relaxed),
+                    FAST_PASSES.load(Relaxed),
+                    COPY_SEGMENTS.load(Relaxed),
+                    DRAWS.load(Relaxed)
+                );
+            }
+        }
+    }
 }
 
 pub use validation::{map_storage_format_from_naga, map_storage_format_to_naga};
