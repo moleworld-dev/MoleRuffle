@@ -48,6 +48,11 @@ fn net_log_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("MOLE_NET_LOG").as_deref() == Ok("1"))
 }
 
+/// 硬停滞上限:所有在途尝试这么久都没有任何进展(响应头或新数据),就全部放弃重来;连续两次则报错。
+/// 没有它的话,"原请求成了死连接、副本又都很快失败"或"副本回 4xx 后不再对冲"时会永远等下去
+/// (切网、断网时真实可达,审查实测),主 SWF 碰上就永远白屏,也触发不了退避重试。
+const HARD_STALL: Duration = Duration::from_secs(15);
+
 /// 第 1/2/3 次对冲距上一次发起的最短间隔(还要同时满足"已停滞 STALL")。
 const HEDGE_GAP: [Duration; 3] = [
     Duration::from_millis(2500),
@@ -94,7 +99,7 @@ pub struct CachingNavigator<N> {
     cache_dir: PathBuf,
     /// 预取中的请求:(匹配键, 是否忽略查询串, 已启动的请求)。匹配的下一次 fetch 直接接手,
     /// 见 [`Self::prefetch`]。
-    prefetched: RefCell<Vec<(String, bool, Prefetch)>>,
+    prefetched: RefCell<Vec<(String, bool, Prefetch, std::time::Instant)>>,
 }
 
 /// 预取的匹配键:完整网址,或忽略查询串时的"去掉查询串与片段的网址"。
@@ -111,8 +116,8 @@ fn prefetch_key(abs: &Url, ignore_query: bool) -> String {
 
 /// 预取请求的状态。
 enum Prefetch {
-    /// 已经轮询过一次(底层 HTTP 请求已在 tokio 线程上发出),还没完成。
-    Pending(OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse>),
+    /// 请求已发出,并交给事件循环在后台继续驱动(对冲、重试照常进行);完成后结果从这里取。
+    Pending(futures::channel::oneshot::Receiver<Result<Box<dyn SuccessResponse>, ErrorResponse>>),
     /// 第一次轮询就完成了(例如命中磁盘缓存)。
     Ready(Result<Box<dyn SuccessResponse>, ErrorResponse>),
 }
@@ -164,16 +169,29 @@ impl<N> CachingNavigator<N> {
             return;
         };
         let mut fut = self.fetch_uncached_prefetch(Request::get(url.to_string()));
+        // 先同步轮询一次:把底层请求立刻推上 tokio(此时事件循环还没开始跑)。
         let waker = futures::task::noop_waker_ref();
         let mut cx = std::task::Context::from_waker(waker);
         let state = match fut.as_mut().poll(&mut cx) {
             std::task::Poll::Ready(result) => Prefetch::Ready(result),
-            std::task::Poll::Pending => Prefetch::Pending(fut),
+            std::task::Poll::Pending => {
+                // 之后交给事件循环在后台继续驱动:被接手之前,对冲/重试/硬停滞上限照常工作
+                // (原先接手前没人轮询,预取卡住时要等到接手才开始对冲)。
+                let (sender, receiver) = futures::channel::oneshot::channel();
+                self.inner.borrow_mut().spawn_future(Box::pin(async move {
+                    let _ = sender.send(fut.await);
+                    Ok(())
+                }));
+                Prefetch::Pending(receiver)
+            }
         };
         tracing::info!("预取: {abs}");
-        self.prefetched
-            .borrow_mut()
-            .push((prefetch_key(&abs, ignore_query), ignore_query, state));
+        self.prefetched.borrow_mut().push((
+            prefetch_key(&abs, ignore_query),
+            ignore_query,
+            state,
+            std::time::Instant::now(),
+        ));
     }
 
     /// 预取用的 fetch:与 [`NavigatorBackend::fetch`] 相同,只是绕开"接手预取"那一步(防止递归)。
@@ -240,9 +258,12 @@ fn is_cacheable(abs: &Url, has_body: bool) -> bool {
 /// 版本闸 `version/zzz_config.txt?<纯数字随机串>` 不匹配,照旧每次取最新。
 /// 保险:命中缓存的同时在后台重新下载一次,内容变了就更新缓存(最多旧一次启动),见 revalidate。
 fn is_versioned_text(abs: &Url) -> bool {
-    // MOLE_CACHE_TEXT=0 关掉(对照/回退用)。
+    // MOLE_CACHE_TEXT=0 关掉(对照/回退用)。只对官方服启用:官方服的这些文件自 2022 年起没变过
+    // (Last-Modified),平行服还在活跃更新,可能出现"内容变了而版本串没变"(审查指出)。
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *OFF.get_or_init(|| std::env::var("MOLE_CACHE_TEXT").as_deref() == Ok("0")) {
+    if *OFF.get_or_init(|| std::env::var("MOLE_CACHE_TEXT").as_deref() == Ok("0"))
+        || server::selected().id != "official"
+    {
         return false;
     }
     let path = abs.path().to_ascii_lowercase();
@@ -287,10 +308,11 @@ fn revalidate<N: NavigatorBackend>(
         if resp.status() != 200 || resp.text_encoding().is_some() {
             return Ok(());
         }
+        let expected = resp.expected_length().ok().flatten();
         let Ok(fresh) = resp.body().await else {
             return Ok(());
         };
-        if fresh != cached {
+        if fresh != cached && text_looks_complete(&url, &fresh, expected) {
             tracing::info!("带版本文本在服务器上已变化,更新缓存(下次启动生效): {url}");
             let _ = workers::offload(move || write_cache_atomic(&path, &fresh)).await;
         }
@@ -299,13 +321,38 @@ fn revalidate<N: NavigatorBackend>(
     inner.borrow_mut().spawn_future(task);
 }
 
+/// 文本内容看起来是完整的正常文件:非空;已知长度时长度一致;`.xml` 去掉 BOM 与空白后以 `<` 开头。
+/// 用来挡住维护期/运营商劫持返回的 200 错误页、无长度时被截断的正文,免得它们进缓存。
+fn text_looks_complete(url: &str, bytes: &[u8], expected: Option<u64>) -> bool {
+    if bytes.is_empty() || expected.is_some_and(|n| n != bytes.len() as u64) {
+        return false;
+    }
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if path.ends_with(".xml") {
+        let body = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+        return body.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'<');
+    }
+    true
+}
+
 /// 本进程里已经后台复核过的带版本文本(每个网址每次启动只复核一次)。
 static REVALIDATED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// 确定性失败(4xx):重试毫无意义,只会把一次 404 放大成 3 次请求 + 3 倍延迟。
 /// 5xx / 网络抖动 / 超时才值得重试(摩尔服务器抖起来确实靠重试救回)。
 fn is_worth_retry(err: &ErrorResponse) -> bool {
-    !matches!(err.error, Error::HttpNotOk(_, status, ..) if (400..500).contains(&status))
+    // 408(请求超时)、425、429(限流)是暂时性的 4xx。
+    !matches!(err.error, Error::HttpNotOk(_, status, ..)
+        if (400..500).contains(&status) && !matches!(status, 408 | 425 | 429))
+}
+
+/// 版本清单 `version/zzz_config.txt`(带每次随机的防缓存串,服务器忽略该串)。
+fn is_version_gate(abs: &Url) -> bool {
+    abs.path().eq_ignore_ascii_case("/version/zzz_config.txt")
 }
 
 /// 把 zlib 压缩的 SWF(`CWS`)解成未压缩的 `FWS`,供引擎直接解析。在后台线程调用。
@@ -370,15 +417,32 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
             && let Ok(abs) = self.inner.borrow().resolve_url(request.url())
         {
             let mut slots = self.prefetched.borrow_mut();
+            // 60 秒还没被接手的预取丢掉(连同它占着的连接):引擎没按预期请求(网址形式不同、
+            // 带了请求头等),留着只会一直占资源。
+            slots.retain(|(key, _, _, at)| {
+                let keep = at.elapsed() < Duration::from_secs(60);
+                if !keep {
+                    tracing::info!("预取 60 秒未被接手,丢弃: {key}");
+                }
+                keep
+            });
             if let Some(index) = slots
                 .iter()
-                .position(|(key, ignore_query, _)| *key == prefetch_key(&abs, *ignore_query))
+                .position(|(key, ignore_query, _, _)| *key == prefetch_key(&abs, *ignore_query))
             {
-                let (key, _, state) = slots.remove(index);
+                let (key, _, state, _) = slots.remove(index);
                 tracing::info!("接手预取的请求: {key}(引擎请求 {abs})");
+                let url = abs.to_string();
                 return match state {
                     Prefetch::Ready(result) => Box::pin(async move { result }),
-                    Prefetch::Pending(fut) => fut,
+                    Prefetch::Pending(receiver) => Box::pin(async move {
+                        receiver.await.unwrap_or_else(|_| {
+                            Err(ErrorResponse {
+                                url,
+                                error: Error::FetchError("预取任务被丢弃".into()),
+                            })
+                        })
+                    }),
                 };
             }
         }
@@ -484,7 +548,14 @@ impl<N: NavigatorBackend> CachingNavigator<N> {
         let on_game_host = abs
             .as_ref()
             .is_some_and(|u| u.host_str() == Some(server::selected().host));
-        let hedge = on_game_host && request.body().is_none();
+        // 对冲只用于静态资源、带版本串的文本、主 SWF 与版本清单;发往游戏主机的其它 GET(可能
+        // 有副作用)只保留原有的"失败后顺序重试"。
+        let hedge = on_game_host
+            && request.body().is_none()
+            && (cache_path.is_some()
+                || abs.as_ref().is_some_and(|u| {
+                    u.path().eq_ignore_ascii_case("/client.swf") || is_version_gate(u)
+                }));
         let is_root = on_game_host
             && abs
                 .as_ref()
@@ -528,7 +599,8 @@ impl<N: NavigatorBackend> CachingNavigator<N> {
                 Body {
                     final_url: String,
                     bytes: Vec<u8>,
-                    has_charset: bool,
+                    encoding: Option<&'static Encoding>,
+                    expected: Option<u64>,
                 },
             }
             let want_body = cache_path.is_some() || is_root;
@@ -559,7 +631,8 @@ impl<N: NavigatorBackend> CachingNavigator<N> {
                         return Ok(Fetched::Response(resp)); // 非 200 不缓存,原样返回
                     }
                     let final_url = resp.url().to_string();
-                    let has_charset = resp.text_encoding().is_some();
+                    let encoding = resp.text_encoding();
+                    let expected = resp.expected_length().ok().flatten();
                     let mut bytes = Vec::with_capacity(
                         resp.expected_length()
                             .ok()
@@ -580,7 +653,8 @@ impl<N: NavigatorBackend> CachingNavigator<N> {
                     Ok(Fetched::Body {
                         final_url,
                         bytes,
-                        has_charset,
+                        encoding,
+                        expected,
                     })
                 })
                     as std::pin::Pin<
@@ -595,32 +669,52 @@ impl<N: NavigatorBackend> CachingNavigator<N> {
             let mut last_launch = started;
             let mut hedges = 0usize;
             let mut failures = 0u32;
+            let mut hard_stalls = 0u32;
             // 收到过确定性失败(4xx)就不再对冲:同一个资源再发也是 4xx。
             let mut no_more_hedge = false;
             let mut last_err: Option<ErrorResponse> = None;
+            // 有别的尝试在途时收到的确定性失败,及收到的时刻:给在途的宽限 STALL,期间没有任何进展就报它。
+            let mut deterministic_err: Option<(ErrorResponse, std::time::Instant)> = None;
+            let timeout_err = |url: &str| ErrorResponse {
+                url: url.to_string(),
+                error: Error::FetchError("请求长时间没有任何进展".into()),
+            };
             let fetched = loop {
-                // 下一次对冲的时刻:距最近一次发起满 HEDGE_GAP[hedges],且距最近一次进展满 STALL。
-                // 不对冲(别的主机)、名额用完、或收到过 4xx 就只等在途的尝试。
-                let hedge_timer = match HEDGE_GAP.get(hedges) {
-                    Some(gap) if hedge && !no_more_hedge => {
-                        let due = (last_launch + *gap).max(last_progress.get() + STALL);
-                        Either::Left(async_io::Timer::at(due))
-                    }
-                    _ => Either::Right(futures::future::pending::<std::time::Instant>()),
-                };
-                match select(in_flight.next(), hedge_timer).await {
+                // 下一次需要醒来的时刻:硬停滞上限、确定性失败的宽限期、重试用尽后的停滞判定、
+                // 下一次对冲(距最近一次发起满 HEDGE_GAP[hedges] 且已停滞 STALL)取最早。
+                let progress = last_progress.get();
+                let mut wake = progress + HARD_STALL;
+                if let Some((_, at)) = &deterministic_err {
+                    wake = wake.min(*at + STALL);
+                }
+                if failures > RETRIES {
+                    wake = wake.min(progress + STALL);
+                }
+                if hedge
+                    && !no_more_hedge
+                    && let Some(gap) = HEDGE_GAP.get(hedges)
+                {
+                    wake = wake.min((last_launch + *gap).max(progress + STALL));
+                }
+                match select(in_flight.next(), async_io::Timer::at(wake)).await {
                     Either::Left((Some(Ok(fetched)), _)) => break fetched,
                     Either::Left((Some(Err(err)), _)) => {
                         failures += 1;
                         let deterministic = !is_worth_retry(&err);
-                        no_more_hedge |= deterministic;
                         if !in_flight.is_empty() {
-                            // 还有别的尝试在途(可能正在正常传输),等它们,不因为某个副本失败就判死。
-                            last_err = Some(err);
+                            // 还有别的尝试在途(可能正在正常传输),先不判死。
+                            if deterministic {
+                                no_more_hedge = true;
+                                if deterministic_err.is_none() {
+                                    deterministic_err = Some((err, std::time::Instant::now()));
+                                }
+                            } else {
+                                last_err = Some(err);
+                            }
                             continue;
                         }
                         // 4xx 是确定性失败(资源真不存在),重试只是把一次 404 放大成 3 次请求。
-                        if failures > RETRIES || deterministic {
+                        if deterministic || failures > RETRIES {
                             return Err(err);
                         }
                         tracing::debug!("拉取失败,重试 {failures}/{RETRIES}: {url}");
@@ -629,26 +723,61 @@ impl<N: NavigatorBackend> CachingNavigator<N> {
                     }
                     Either::Left((None, _)) => {
                         // 不会发生(失败分支保证要么返回、要么留一个在途);以防万一按失败处理。
-                        return Err(last_err.take().unwrap_or_else(|| ErrorResponse {
-                            url: url.clone(),
-                            error: Error::FetchError("没有在途的请求".into()),
-                        }));
+                        return Err(last_err.take().unwrap_or_else(|| timeout_err(&url)));
                     }
-                    Either::Right((now, _)) => {
-                        // 计时器到点期间可能刚有进展,再确认一次确实停滞了。
-                        if now < last_progress.get() + STALL {
+                    Either::Right(_) => {
+                        // 用"现在"而不是计时器的到期时刻:主线程卡顿/切后台/预取迟接手后,
+                        // 过期的几档不会被当成"刚到点"而一次连发。
+                        let now = std::time::Instant::now();
+                        let progress = last_progress.get();
+                        let stalled = now.saturating_duration_since(progress);
+                        // ① 确定性失败的宽限期到了,且之后在途的尝试没有任何进展 → 报这个 4xx。
+                        if let Some((_, at)) = &deterministic_err
+                            && now >= *at + STALL
+                            && progress <= *at
+                        {
+                            return Err(deterministic_err.take().expect("上面刚检查过").0);
+                        }
+                        // ② 硬停滞上限:全部放弃;第二次就报错。
+                        if stalled >= HARD_STALL {
+                            hard_stalls += 1;
+                            tracing::warn!(
+                                "请求 {:.0} 秒没有任何进展,放弃在途的 {} 个尝试(第 {hard_stalls} 次): {url}",
+                                stalled.as_secs_f32(),
+                                in_flight.len()
+                            );
+                            in_flight = FuturesUnordered::new();
+                            if hard_stalls >= 2 {
+                                return Err(last_err.take().unwrap_or_else(|| timeout_err(&url)));
+                            }
+                            in_flight.push(make_attempt());
+                            last_launch = now;
+                            last_progress.set(now);
+                            hedges = 0;
                             continue;
                         }
-                        hedges += 1;
-                        tracing::info!(
-                            "请求停滞 {:.1} 秒(距发起 {:.1} 秒),并发再发一次(第 {} 个副本): {url}",
-                            last_progress.get().elapsed().as_secs_f32(),
-                            started.elapsed().as_secs_f32(),
-                            hedges
-                        );
-                        HEDGED_REQUESTS.fetch_add(1, Ordering::Relaxed);
-                        in_flight.push(make_attempt());
-                        last_launch = now;
+                        // ③ 重试已用尽,在途的又停滞了 → 不再干等。
+                        if failures > RETRIES && stalled >= STALL {
+                            return Err(last_err.take().unwrap_or_else(|| timeout_err(&url)));
+                        }
+                        // ④ 对冲。
+                        if hedge
+                            && !no_more_hedge
+                            && let Some(gap) = HEDGE_GAP.get(hedges)
+                            && now >= last_launch + *gap
+                            && stalled >= STALL
+                        {
+                            hedges += 1;
+                            tracing::info!(
+                                "请求停滞 {:.1} 秒(距发起 {:.1} 秒),并发再发一次(第 {} 个副本): {url}",
+                                stalled.as_secs_f32(),
+                                started.elapsed().as_secs_f32(),
+                                hedges
+                            );
+                            HEDGED_REQUESTS.fetch_add(1, Ordering::Relaxed);
+                            in_flight.push(make_attempt());
+                            last_launch = now;
+                        }
                     }
                 }
             };
@@ -659,15 +788,21 @@ impl<N: NavigatorBackend> CachingNavigator<N> {
                 Fetched::Body {
                     final_url,
                     bytes,
-                    has_charset,
+                    encoding,
+                    expected,
                 } => {
-                    // 文本文件:响应头带了字符集就不缓存(缓存返回的响应没有字符集,解码可能不同)。
-                    let cache_path = cache_path
-                        .filter(|_| !(has_charset && abs.as_ref().is_some_and(is_versioned_text)));
+                    // 文本文件:响应头带了字符集,或内容不像完整的正常文件(错误页、截断),就不写缓存。
+                    let is_text = abs.as_ref().is_some_and(is_versioned_text);
+                    let cache_path = cache_path.filter(|_| {
+                        !is_text
+                            || (encoding.is_none()
+                                && text_looks_complete(&final_url, &bytes, expected))
+                    });
                     let Some(path) = cache_path else {
-                        // root SWF:不进磁盘缓存(版本闸),body 已读完,直接交给引擎。
-                        return Ok(Box::new(CachedResponse::new(final_url, bytes))
-                            as Box<dyn SuccessResponse>);
+                        // root SWF / 不缓存的文本:body 已读完,原样(连同字符集)交给引擎。
+                        let mut resp = CachedResponse::new(final_url, bytes);
+                        resp.text_encoding = encoding;
+                        return Ok(Box::new(resp) as Box<dyn SuccessResponse>);
                     };
                     // 写盘(存原始压缩数据,不占用户存储)+ 解压都在后台线程。
                     let prepared = workers::offload(move || {
@@ -697,6 +832,8 @@ struct CachedResponse {
     url: String,
     bytes: Vec<u8>,
     chunk_done: bool,
+    /// 原响应头里的字符集(从网络读完正文再包装时原样带上;磁盘缓存命中时为 None)。
+    text_encoding: Option<&'static Encoding>,
 }
 
 impl CachedResponse {
@@ -705,6 +842,7 @@ impl CachedResponse {
             url,
             bytes,
             chunk_done: false,
+            text_encoding: None,
         }
     }
 }
@@ -724,7 +862,7 @@ impl SuccessResponse for CachedResponse {
     }
 
     fn text_encoding(&self) -> Option<&'static Encoding> {
-        None
+        self.text_encoding
     }
 
     fn status(&self) -> u16 {
@@ -892,6 +1030,21 @@ mod tests {
     }
 
     #[test]
+    fn 文本内容校验挡住错误页与截断() {
+        use super::text_looks_complete as ok;
+        assert!(ok(
+            "a/Server.xml?i1",
+            b"\xEF\xBB\xBF <?xml version=\"1.0\"?><a/>",
+            None
+        ));
+        assert!(ok("a/x.xml", b"<taomee/>", Some(9)));
+        assert!(!ok("a/x.xml", b"<taomee/>", Some(100)), "长度不符(截断)");
+        assert!(!ok("a/x.xml", b"", None), "空正文");
+        assert!(!ok("a/x.xml", b"Service Unavailable", None), "错误页");
+        assert!(ok("a/x.txt", b"1452075536", None));
+    }
+
+    #[test]
     fn 带版本串的配置文本可缓存而版本闸不可() {
         use super::is_versioned_text;
         let host = crate::server::selected().host;
@@ -995,6 +1148,8 @@ mod hedge_tests {
         /// 第 i 次 fetch 用第 i 个剧本(超出则重复最后一个)。
         scripts: Vec<Script>,
         calls: Rc<RefCell<Vec<Instant>>>,
+        /// spawn_future 交来的任务放到这个本地执行器上(没有就丢弃)。
+        spawner: Option<futures::executor::LocalSpawner>,
     }
 
     impl NavigatorBackend for MockNav {
@@ -1044,7 +1199,14 @@ mod hedge_tests {
             Url::parse(url)
         }
 
-        fn spawn_future(&mut self, _future: OwnedFuture<(), Error>) {}
+        fn spawn_future(&mut self, future: OwnedFuture<(), Error>) {
+            use futures::task::LocalSpawnExt;
+            if let Some(spawner) = &self.spawner {
+                let _ = spawner.spawn_local(async move {
+                    let _ = future.await;
+                });
+            }
+        }
 
         fn pre_process_url(&self, url: Url) -> Url {
             url
@@ -1118,6 +1280,7 @@ mod hedge_tests {
             MockNav {
                 scripts,
                 calls: calls.clone(),
+                spawner: None,
             },
             dir.clone(),
         );
@@ -1262,6 +1425,7 @@ mod hedge_tests {
     fn 预取的请求被同一网址的引擎请求接手且只发一次() {
         let dir = std::env::temp_dir().join(format!("mole-prefetch-test-{}", std::process::id()));
         let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut pool = futures::executor::LocalPool::new();
         let nav = CachingNavigator::new(
             MockNav {
                 scripts: vec![Script::Ok {
@@ -1270,6 +1434,7 @@ mod hedge_tests {
                     gap: MS(10),
                 }],
                 calls: calls.clone(),
+                spawner: Some(pool.spawner()),
             },
             dir.clone(),
         );
@@ -1278,12 +1443,12 @@ mod hedge_tests {
         assert_eq!(calls.borrow().len(), 1, "预取应立即发出请求");
         // 别的网址不会接手预取
         let other = format!("http://{}/other.xml", server::selected().host);
-        let _ = futures::executor::block_on(nav.fetch(Request::get(other)));
+        let _ = pool.run_until(nav.fetch(Request::get(other)));
         assert_eq!(nav.prefetched.borrow().len(), 1, "别的网址不应消费预取");
         // 模拟"渲染器初始化"耗时 200ms,之后引擎请求同一网址
         std::thread::sleep(MS(200));
         let takeover = Instant::now();
-        let len = futures::executor::block_on(async {
+        let len = pool.run_until(async {
             nav.fetch(Request::get(url))
                 .await
                 .ok()?
@@ -1304,6 +1469,7 @@ mod hedge_tests {
     fn 版本清单按路径预取且只被同路径接手() {
         let dir = std::env::temp_dir().join(format!("mole-prefetch-q-{}", std::process::id()));
         let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut pool = futures::executor::LocalPool::new();
         let nav = CachingNavigator::new(
             MockNav {
                 scripts: vec![Script::Ok {
@@ -1312,19 +1478,175 @@ mod hedge_tests {
                     gap: MS(5),
                 }],
                 calls: calls.clone(),
+                spawner: Some(pool.spawner()),
             },
             dir.clone(),
         );
         let host = server::selected().host;
         nav.prefetch_ignoring_query(&format!("http://{host}/version/zzz_config.txt"));
         // 同路径、带随机串的引擎请求接手预取
-        let ok = futures::executor::block_on(nav.fetch(Request::get(format!(
-            "http://{host}/version/zzz_config.txt?7898149"
-        ))))
-        .is_ok();
+        let ok = pool
+            .run_until(nav.fetch(Request::get(format!(
+                "http://{host}/version/zzz_config.txt?7898149"
+            ))))
+            .is_ok();
         assert!(ok);
         assert_eq!(calls.borrow().len(), 1, "应接手预取而不是重新请求");
         assert!(nav.prefetched.borrow().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 带超时地跑一次 fetch:超时返回 None(用来抓"永远不返回")。
+    fn run_with_timeout(
+        scripts: Vec<Script>,
+        path: &str,
+        limit: Duration,
+    ) -> (Option<bool>, Vec<f32>) {
+        let dir = std::env::temp_dir().join(format!(
+            "mole-hang-test-{}-{}",
+            std::process::id(),
+            path.replace('/', "_")
+        ));
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let nav = CachingNavigator::new(
+            MockNav {
+                scripts,
+                calls: calls.clone(),
+                spawner: None,
+            },
+            dir.clone(),
+        );
+        let url = format!("http://{}/{path}", server::selected().host);
+        let start = Instant::now();
+        let result = futures::executor::block_on(async {
+            use futures::future::{Either, select};
+            let fetch = Box::pin(async { nav.fetch(Request::get(url)).await.is_ok() });
+            match select(fetch, async_io::Timer::after(limit)).await {
+                Either::Left((ok, _)) => Some(ok),
+                Either::Right(_) => None,
+            }
+        });
+        let at = calls
+            .borrow()
+            .iter()
+            .map(|t| t.duration_since(start).as_secs_f32())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        (result, at)
+    }
+
+    #[test]
+    fn 原请求死连接且副本都失败时会报错而不是永远等() {
+        let (done, calls) = run_with_timeout(
+            vec![
+                Script::Hang,
+                Script::Fail {
+                    delay: MS(50),
+                    status: 0,
+                },
+            ],
+            "deadconn/Client.swf",
+            Duration::from_secs(25),
+        );
+        assert_eq!(done, Some(false), "应当在合理时间内报错:{calls:?}");
+    }
+
+    #[test]
+    fn 副本回四百零四而原请求卡死时报四百零四() {
+        let (done, calls) = run_with_timeout(
+            vec![
+                Script::Hang,
+                Script::Fail {
+                    delay: MS(50),
+                    status: 404,
+                },
+            ],
+            "deadconn404/a.swf",
+            Duration::from_secs(15),
+        );
+        assert_eq!(done, Some(false), "应当报 404:{calls:?}");
+    }
+
+    #[test]
+    fn 全部尝试都卡死时有硬上限() {
+        let (done, calls) =
+            run_with_timeout(vec![Script::Hang], "allhang/a.swf", Duration::from_secs(45));
+        assert_eq!(done, Some(false), "应当在硬上限后报错:{calls:?}");
+    }
+
+    #[test]
+    fn 接手迟到时只补发一个副本() {
+        let dir = std::env::temp_dir().join(format!("mole-burst-{}", std::process::id()));
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut pool = futures::executor::LocalPool::new();
+        let nav = CachingNavigator::new(
+            MockNav {
+                scripts: vec![
+                    Script::Hang,
+                    Script::Ok {
+                        header: MS(300),
+                        chunks: 1,
+                        gap: MS(5),
+                    },
+                ],
+                calls: calls.clone(),
+                spawner: Some(pool.spawner()),
+            },
+            dir.clone(),
+        );
+        let url = format!("http://{}/Client.swf", server::selected().host);
+        nav.prefetch(&url);
+        // 主线程忙了 7 秒才接手(对冲时间表里的前两档都已过期)
+        std::thread::sleep(Duration::from_secs(7));
+        let ok = pool.run_until(async { nav.fetch(Request::get(url)).await.is_ok() });
+        assert!(ok);
+        assert_eq!(
+            calls.borrow().len(),
+            2,
+            "接手时应只补发一个:{:?}",
+            calls.borrow()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 预取在被接手前就会对冲() {
+        let dir = std::env::temp_dir().join(format!("mole-prefetch-bg-{}", std::process::id()));
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let mut pool = futures::executor::LocalPool::new();
+        let nav = CachingNavigator::new(
+            MockNav {
+                scripts: vec![
+                    Script::Hang,
+                    Script::Ok {
+                        header: MS(100),
+                        chunks: 1,
+                        gap: MS(5),
+                    },
+                ],
+                calls: calls.clone(),
+                spawner: Some(pool.spawner()),
+            },
+            dir.clone(),
+        );
+        let host = server::selected().host;
+        nav.prefetch_ignoring_query(&format!("http://{host}/version/zzz_config.txt?1111111"));
+        // 事件循环照常运转 3.5 秒(引擎还没来请求它):这期间预取应已自行对冲并拿到结果
+        pool.run_until(async_io::Timer::after(MS(3500)));
+        assert_eq!(
+            calls.borrow().len(),
+            2,
+            "接手前应已对冲:{:?}",
+            calls.borrow()
+        );
+        let takeover = Instant::now();
+        let ok = pool
+            .run_until(nav.fetch(Request::get(format!(
+                "http://{host}/version/zzz_config.txt?2222222"
+            ))))
+            .is_ok();
+        assert!(ok);
+        assert!(takeover.elapsed() < MS(100), "接手时结果应已就绪");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

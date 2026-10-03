@@ -8,4 +8,8 @@
   主线程的 `new_buffer` / `new_texture` / `new_sampler` 都会被挡住(冷缓存时一条管线 20~35ms)。
   MTLDevice 按苹果文档线程安全。
 
-升级 wgpu 时:重新拷贝对应版本的 wgpu-hal 源码,把上述两处搬过去,再跑 `desktop/fastcb-regress.sh`。
+- `src/lib.rs`:标记常量 `MOLERUFFLE_PATCHED_METAL_COMPILE_UNLOCKED`。MoleRuffle 的 desktop crate 经
+  `wgpu::hal::` 引用它 —— 升级 wgpu 后补丁没被用上时编译直接失败(cargo 对没用上的 [patch] 只给一条告警)。
+
+升级 wgpu 时:重新拷贝对应版本的 wgpu-hal 源码,把上述三处搬过去,再跑 `desktop/fastcb-regress.sh`
+(图像回归验证不了"去锁"的效果,只保证没有画面回归;去锁本身靠上面的编译期标记保证补丁被用上)。

@@ -77,10 +77,10 @@ pub fn default_stage_quality() -> StageQuality {
 /// `set_var` 与其它线程同时读环境变量(C 的 getenv)是未定义行为,而一进入事件循环,
 /// tokio 运行时、缓存清理线程、音频线程、Metal 线程都已经在跑。多次调用只有第一次生效。
 ///
-/// 开关文件 `flags.txt`(每行 `KEY=值`,`#` 开头为注释),按顺序找:
-///   1. `<文稿目录>/flags.txt` —— iOS 上就是 App 的"文稿"目录,Info.plist 打开了文件共享,
-///      用户能在"文件"App →"我的 iPhone"→ MoleRuffle 里放进去;
-///   2. `<数据目录>/MoleRuffle/flags.txt` —— 桌面(mac 为 ~/Library/Application Support/MoleRuffle)。
+/// 开关文件 `flags.txt`(每行 `KEY=0` 或 `KEY=1`,`#` 开头为注释;只认 `FLAG_KEYS` 里的回退开关):
+///   - iOS:App 的"文稿"目录(Info.plist 打开了文件共享,用户能在"文件"App →"我的 iPhone"→
+///     MoleRuffle 里放进去),其次 `<数据目录>/MoleRuffle/flags.txt`;
+///   - 桌面:`<数据目录>/MoleRuffle/flags.txt`(mac 为 ~/Library/Application Support/MoleRuffle)。
 /// 移动端设不了环境变量,这是现场关掉某项新功能(例如 `MOLE_DIRTY_RECT=0`、`MOLE_METAL_SINGLE_CB=0`)
 /// 的唯一办法。真正的环境变量优先于文件。
 pub fn init_process_env() {
@@ -120,25 +120,34 @@ fn set_default(key: &str, value: &str) {
 
 /// 读 `flags.txt`(见 `init_process_env`)。
 fn load_flags_file() {
+    // iOS:App 的"文稿"目录(Info.plist 开了文件共享,用户能在"文件"App 里放文件)。
+    // 桌面:只读 <数据目录>/MoleRuffle/flags.txt —— 不读 ~/Documents(会弹隐私授权,也可能误读同名文件)。
+    #[cfg(target_os = "ios")]
     let candidates = [
         dirs::document_dir().map(|d| d.join("flags.txt")),
         dirs::data_local_dir().map(|d| d.join("MoleRuffle").join("flags.txt")),
     ];
+    #[cfg(not(target_os = "ios"))]
+    let candidates = [dirs::data_local_dir().map(|d| d.join("MoleRuffle").join("flags.txt"))];
     for path in candidates.into_iter().flatten() {
         let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let mut applied = Vec::new();
-        for line in text.lines() {
+        let (mut applied, mut ignored) = (Vec::new(), Vec::new());
+        for line in text.trim_start_matches('\u{feff}').lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
             let Some((key, value)) = line.split_once('=') else {
+                ignored.push(line.to_string());
                 continue;
             };
             let (key, value) = (key.trim(), value.trim());
-            if key.is_empty() || key.contains('\0') || value.contains('\0') {
+            // 只放行这些回退开关,取值只认 0/1:这个文件是给"现场关掉某项新功能"用的,不能变成
+            // 改任意环境变量的入口(例如 MOLE_FPS 会让帧基游戏整体加速)。
+            if !FLAG_KEYS.contains(&key) || !matches!(value, "0" | "1") {
+                ignored.push(format!("{key}={value}"));
                 continue;
             }
             if std::env::var_os(key).is_none() {
@@ -148,12 +157,34 @@ fn load_flags_file() {
             }
         }
         // 日志系统此时可能还没初始化,先放进全局,初始化后由壳层打印。
+        let mut note = format!("{}: 生效 [{}]", path.display(), applied.join(" "));
+        if !ignored.is_empty() {
+            note.push_str(&format!(
+                " 忽略 [{}](只认下列开关且取值为 0/1:{})",
+                ignored.join(" "),
+                FLAG_KEYS.join(" ")
+            ));
+        }
         FLAGS_APPLIED
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(format!("{}: {}", path.display(), applied.join(" ")));
+            .push(note);
     }
 }
+
+/// flags.txt 允许设置的开关(都是新功能的回退开关,取值 0/1)。
+const FLAG_KEYS: &[&str] = &[
+    "MOLE_DIRTY_RECT",
+    "MOLE_CAB_MEMO",
+    "MOLE_BLEND_DEFER",
+    "MOLE_CAB_BLIT",
+    "MOLE_XFORM_64K",
+    "MOLE_METAL_SINGLE_CB",
+    "MOLE_PREWARM",
+    "MOLE_PREFETCH",
+    "MOLE_CACHE_TEXT",
+    "MOLE_FAST_PATHS",
+];
 
 /// 开关文件里实际生效的项(供壳层在日志初始化后打印)。
 pub static FLAGS_APPLIED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());

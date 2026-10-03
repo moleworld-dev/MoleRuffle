@@ -335,6 +335,8 @@ impl App {
         // 引擎稍后请求同一 URL 时由缓存层直接接手(见 CachingNavigator::prefetch)。
         // 音频:后端内部有不能跨线程的回调,只能在主线程建;这里先在后台线程把系统音频层预热
         // (查一次默认输出设备与配置,CoreAudio HAL 初始化实测 9~86ms),主线程稍后再建就快了。
+        // 只在 macOS 上做:iOS 上 default_output_config 会新建并初始化一个 RemoteIO 再销毁,收益没验证过。
+        #[cfg(target_os = "macos")]
         let _ = std::thread::Builder::new()
             .name("mole-audio-warm".into())
             .spawn(|| {
@@ -371,8 +373,13 @@ impl App {
             navigator.prefetch(mole::server::selected().swf_url);
             // 版本清单:主 SWF 加载后第一件事就是请求它(带每次随机的防缓存串,服务器忽略该串),
             // 两者原本串行、各自都可能卡几秒;同时预取把等待从相加变成取最大值。
+            // 预取网址也带一个随机串(与游戏一样防运营商透明缓存;匹配时忽略查询串)。
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() % 9_000_000 + 1_000_000)
+                .unwrap_or(1_234_567);
             navigator.prefetch_ignoring_query(&format!(
-                "{}version/zzz_config.txt",
+                "{}version/zzz_config.txt?{nonce}",
                 mole::game_base_url()
             ));
         }
@@ -459,8 +466,14 @@ impl App {
             let descriptors = std::sync::Arc::new(descriptors);
             // 后台预建滤镜/离屏表面的渲染管线(ruffle-fork descriptors.rs)。不预建的话它们在登录页
             // 首次出现发光/模糊时在主线程上编译,卡 100~170ms;现在主 SWF 还在下载,正好空闲。
+            // vendor/wgpu-hal 补丁的编译期绊线:补丁没被用上时这里编译失败(见 vendor/wgpu-hal/MOLERUFFLE.md)。
+            const _: bool = wgpu::hal::MOLERUFFLE_PATCHED_METAL_COMPILE_UNLOCKED;
+            // 后台预建只对 Metal / Vulkan 有意义:GL 后端编译期间持有 GL 上下文锁,预建反而挡主线程。
             // MOLE_PREWARM=0 关掉(对照用)。
-            if std::env::var("MOLE_PREWARM").as_deref() != Ok("0") {
+            let backend = descriptors.adapter.get_info().backend;
+            if matches!(backend, wgpu::Backend::Metal | wgpu::Backend::Vulkan)
+                && std::env::var("MOLE_PREWARM").as_deref() != Ok("0")
+            {
                 use ruffle_render_wgpu::target::RenderTarget;
                 let _ = ruffle_render_wgpu::descriptors::spawn_pipeline_prewarm(
                     descriptors.clone(),
