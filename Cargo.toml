@@ -70,6 +70,8 @@ opt-level = 3
 # ───────────────────────────────────────────────────────────────────────────
 [patch.crates-io]
 wgpu-core = { path = "vendor/wgpu-core" }
+# wgpu-hal 本地补丁:Metal 着色器/管线编译不再持有设备锁(见 vendor/wgpu-hal/MOLERUFFLE.md)。
+wgpu-hal = { path = "vendor/wgpu-hal" }
 
 # ───────────────────────────────────────────────────────────────────────────
 # 【可一键回退】本地 Ruffle fork:把所有出自 ruffle git 源的 crate 重定向到本地克隆
