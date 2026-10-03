@@ -2497,6 +2497,7 @@ dependencies = [
  "android_logger",
  "anyhow",
  "async-task",
+ "cpal",
  "futures",
  "jni 0.21.1",
  "log",

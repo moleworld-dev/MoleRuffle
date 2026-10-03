@@ -385,9 +385,8 @@ pub static ROOT_LOAD_FAILED: std::sync::atomic::AtomicBool =
 /// 其余方法全部 no-op(本客户端不需要剪贴板/对话框等)。
 #[derive(Clone)]
 pub struct MoleUiBackend {
-    /// 系统字体库。要用 `make_shared_face_data`(需要 &mut)把字体文件改成共享映射,所以包一层锁;
-    /// 只在首次用到某个(字体名, 粗, 斜)组合时访问,没有竞争。
-    fonts: Arc<std::sync::Mutex<fontdb::Database>>,
+    /// 系统字体库(后台线程扫描,首次用到时才等它扫完,见 [`FontLibrary`])。
+    fonts: Arc<FontLibrary>,
     /// 应用内剪贴板兜底(移动端无系统剪贴板时用;桌面也作镜像)。
     clip: Arc<std::sync::Mutex<String>>,
     /// 是否需要弹出软键盘:Flash 文本框聚焦时引擎调 open_virtual_keyboard 置 true,
@@ -397,7 +396,59 @@ pub struct MoleUiBackend {
 
 impl MoleUiBackend {
     /// 加载系统字体(mac=PingFang / win=YaHei / iOS=PingFang / Android=Noto CJK)。
+    ///
+    /// 扫描放在后台线程(两千多个字体面,实测 25~150ms,原先挡在主 SWF 请求发出之前);
+    /// 第一次真正要字体时才等它扫完——登录页第一个设备字体请求出现在启动后约 7 秒,实际不会等。
     pub fn with_system_fonts() -> Self {
+        let loading = std::thread::Builder::new()
+            .name("mole-fontdb".into())
+            .spawn(scan_system_fonts)
+            .ok();
+        Self {
+            fonts: Arc::new(FontLibrary {
+                db: std::sync::Mutex::new(None),
+                loading: std::sync::Mutex::new(loading),
+            }),
+            clip: Arc::new(std::sync::Mutex::new(String::new())),
+            kbd: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
+/// 后台扫描中的系统字体库。
+pub struct FontLibrary {
+    db: std::sync::Mutex<Option<fontdb::Database>>,
+    loading: std::sync::Mutex<Option<std::thread::JoinHandle<fontdb::Database>>>,
+}
+
+impl FontLibrary {
+    /// 取字体库(还在扫描就等它扫完;扫描线程起不来或崩了就当场同步扫一遍)。
+    fn get(&self) -> std::sync::MutexGuard<'_, Option<fontdb::Database>> {
+        let mut db = self.db.lock().unwrap_or_else(|e| e.into_inner());
+        if db.is_none() {
+            let handle = self
+                .loading
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            let started = std::time::Instant::now();
+            let scanned = handle
+                .and_then(|h| h.join().ok())
+                .unwrap_or_else(scan_system_fonts);
+            let waited = started.elapsed().as_millis();
+            if waited > 5 {
+                tracing::info!("等待字体库扫描 {waited}ms");
+            }
+            *db = Some(scanned);
+        }
+        db
+    }
+}
+
+/// 扫描系统字体目录。
+fn scan_system_fonts() -> fontdb::Database {
+    let started = std::time::Instant::now();
+    {
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
         // iOS/Android 上 `load_system_fonts` 常找不到系统字体目录(返回 0),
@@ -413,14 +464,16 @@ impl MoleUiBackend {
         ] {
             db.load_fonts_dir(dir);
         }
-        tracing::info!("MoleUiBackend: 载入 {} 个字体面", db.len());
-        Self {
-            fonts: Arc::new(std::sync::Mutex::new(db)),
-            clip: Arc::new(std::sync::Mutex::new(String::new())),
-            kbd: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        }
+        tracing::info!(
+            "MoleUiBackend: 载入 {} 个字体面(后台扫描 {}ms)",
+            db.len(),
+            started.elapsed().as_millis()
+        );
+        db
     }
+}
 
+impl MoleUiBackend {
     /// 平台壳取这个标志:为 true 时该弹软键盘(set_ime_allowed(true)),false 时收起。
     pub fn keyboard_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
         self.kbd.clone()
@@ -446,7 +499,10 @@ impl MoleUiBackend {
             },
             ..Default::default()
         };
-        let mut fonts = self.fonts.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self.fonts.get();
+        let Some(fonts) = guard.as_mut() else {
+            return false;
+        };
         let Some(id) = fonts.query(&q) else {
             return false;
         };
@@ -459,7 +515,7 @@ impl MoleUiBackend {
         let Some((data, index)) = (unsafe { fonts.make_shared_face_data(id) }) else {
             return false;
         };
-        drop(fonts);
+        drop(guard);
         register(FontDefinition::FontFile {
             name: query.name.clone(),
             is_bold: query.is_bold,

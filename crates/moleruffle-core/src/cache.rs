@@ -42,6 +42,12 @@ const RETRIES: u32 = 2;
 /// 会把 1MB 的资源复制 2~4 份,审查指出)。时间表按"距最近一次发起"计,每档对冲独立计数,
 /// 失败重试不占对冲名额;主线程卡顿或切后台恢复后最多补发一个,不会把剩下几档一次全发出去。
 const STALL: Duration = Duration::from_millis(2500);
+/// 是否打印每个网络尝试的首字节时间(env `MOLE_NET_LOG=1`)。
+fn net_log_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("MOLE_NET_LOG").as_deref() == Ok("1"))
+}
+
 /// 第 1/2/3 次对冲距上一次发起的最短间隔(还要同时满足"已停滞 STALL")。
 const HEDGE_GAP: [Duration; 3] = [
     Duration::from_millis(2500),
@@ -86,6 +92,29 @@ pub fn cache_summary() -> (u64, u64, u64, u64) {
 pub struct CachingNavigator<N> {
     inner: Rc<RefCell<N>>,
     cache_dir: PathBuf,
+    /// 预取中的请求:(匹配键, 是否忽略查询串, 已启动的请求)。匹配的下一次 fetch 直接接手,
+    /// 见 [`Self::prefetch`]。
+    prefetched: RefCell<Vec<(String, bool, Prefetch)>>,
+}
+
+/// 预取的匹配键:完整网址,或忽略查询串时的"去掉查询串与片段的网址"。
+fn prefetch_key(abs: &Url, ignore_query: bool) -> String {
+    if ignore_query {
+        let mut u = abs.clone();
+        u.set_query(None);
+        u.set_fragment(None);
+        u.to_string()
+    } else {
+        abs.to_string()
+    }
+}
+
+/// 预取请求的状态。
+enum Prefetch {
+    /// 已经轮询过一次(底层 HTTP 请求已在 tokio 线程上发出),还没完成。
+    Pending(OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse>),
+    /// 第一次轮询就完成了(例如命中磁盘缓存)。
+    Ready(Result<Box<dyn SuccessResponse>, ErrorResponse>),
 }
 
 impl<N> CachingNavigator<N> {
@@ -96,7 +125,66 @@ impl<N> CachingNavigator<N> {
         Self {
             inner: Rc::new(RefCell::new(inner)),
             cache_dir,
+            prefetched: RefCell::new(Vec::new()),
         }
+    }
+
+    /// ★预取★:立刻对 `url` 发起 GET(与之后引擎的请求走完全相同的路径:对冲、重试、读 body),
+    /// 并把这个已经在路上的请求留着;稍后同一 URL 的 fetch 直接接手,不再另发。
+    ///
+    /// 为什么:主 SWF 原本要等渲染器(冷缓存时着色器编译约 0.5 秒)、字体库、音频都初始化完,
+    /// 引擎才发出请求;而白屏的主体是网络等待(剖析:加载窗口里主线程只忙 6~12%)。宿主在创建
+    /// 渲染器之前调用它,让网络与这些初始化并行。
+    ///
+    /// 必须在 tokio 运行时上下文里调用(底层请求在第一次轮询时就 spawn 到 tokio 上)。
+    /// 这里用空唤醒器同步轮询一次,只为把请求推出去;之后接手的 fetch 会用真正的唤醒器继续轮询。
+    pub fn prefetch(&self, url: &str)
+    where
+        N: NavigatorBackend,
+    {
+        self.prefetch_with(url, false);
+    }
+
+    /// 同 [`Self::prefetch`],但之后匹配时【忽略查询串】:给"网址带每次随机的防缓存串、
+    /// 而服务器其实忽略它"的文件用。只应用于确认过这一点的文件(版本清单
+    /// `version/zzz_config.txt?<随机数>`:实测不同随机串的内容与 ETag 完全相同)。
+    /// 内容同样是本次启动刚取到的,新鲜度与不预取相同,只是提前到和主 SWF 并行。
+    pub fn prefetch_ignoring_query(&self, url: &str)
+    where
+        N: NavigatorBackend,
+    {
+        self.prefetch_with(url, true);
+    }
+
+    fn prefetch_with(&self, url: &str, ignore_query: bool)
+    where
+        N: NavigatorBackend,
+    {
+        let Ok(abs) = self.inner.borrow().resolve_url(url) else {
+            return;
+        };
+        let mut fut = self.fetch_uncached_prefetch(Request::get(url.to_string()));
+        let waker = futures::task::noop_waker_ref();
+        let mut cx = std::task::Context::from_waker(waker);
+        let state = match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(result) => Prefetch::Ready(result),
+            std::task::Poll::Pending => Prefetch::Pending(fut),
+        };
+        tracing::info!("预取: {abs}");
+        self.prefetched
+            .borrow_mut()
+            .push((prefetch_key(&abs, ignore_query), ignore_query, state));
+    }
+
+    /// 预取用的 fetch:与 [`NavigatorBackend::fetch`] 相同,只是绕开"接手预取"那一步(防止递归)。
+    fn fetch_uncached_prefetch(
+        &self,
+        request: Request,
+    ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse>
+    where
+        N: NavigatorBackend,
+    {
+        self.fetch_inner(request)
     }
 
     /// URL → 缓存文件路径(对完整 URL 取稳定 hash,按前两位分桶,避免单目录文件过多)。
@@ -140,8 +228,79 @@ fn is_cacheable(abs: &Url, has_body: bool) -> bool {
     if path.eq_ignore_ascii_case("/client.swf") {
         return false; // ★ root 版本闸,必须每次拿最新
     }
-    STATIC_EXT.iter().any(|ext| path.ends_with(ext))
+    STATIC_EXT.iter().any(|ext| path.ends_with(ext)) || is_versioned_text(abs)
 }
+
+/// 带版本串的配置/文本文件(4. 条):`.xml` / `.txt`,且查询串正好是游戏版本清单派生的版本号
+/// `i` + 6~10 位小写字母数字(如 `config/Server.xml?i6ooed60`)。资源 SWF 用的是同一种版本串
+/// (`LoginHome.swf?ij2o74r4`),文件一变清单就给新串、网址就变,所以和 SWF 一样可以按完整网址缓存。
+///
+/// 为什么要缓存:登录路径是一条串行链 —— 主 SWF → 版本闸 → loadingWord.xml → Server.xml → ext.xml,
+/// 这台服务器上每个小文件要 0.4~2.7 秒(实测),三个 XML 加起来每次登录白等 2~6 秒。
+/// 版本闸 `version/zzz_config.txt?<纯数字随机串>` 不匹配,照旧每次取最新。
+/// 保险:命中缓存的同时在后台重新下载一次,内容变了就更新缓存(最多旧一次启动),见 revalidate。
+fn is_versioned_text(abs: &Url) -> bool {
+    // MOLE_CACHE_TEXT=0 关掉(对照/回退用)。
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("MOLE_CACHE_TEXT").as_deref() == Ok("0")) {
+        return false;
+    }
+    let path = abs.path().to_ascii_lowercase();
+    if !(path.ends_with(".xml") || path.ends_with(".txt")) {
+        return false;
+    }
+    let Some(query) = abs.query() else {
+        return false;
+    };
+    let token = query.as_bytes();
+    token.len() >= 7
+        && token.len() <= 11
+        && token[0] == b'i'
+        && token[1..]
+            .iter()
+            .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+}
+
+/// 后台复核一个命中缓存的带版本文本:重新下载,内容和缓存不同就覆盖缓存(下次启动生效)。
+/// 不影响本次返回;失败静默。每个网址每次启动只复核一次。
+fn revalidate<N: NavigatorBackend>(
+    inner: &Rc<RefCell<N>>,
+    url: String,
+    path: Option<PathBuf>,
+    cached: Vec<u8>,
+) {
+    let Some(path) = path else {
+        return;
+    };
+    {
+        let mut done = REVALIDATED.lock().unwrap_or_else(|e| e.into_inner());
+        if done.contains(&url) {
+            return;
+        }
+        done.push(url.clone());
+    }
+    let fut = inner.borrow().fetch(Request::get(url.clone()));
+    let task = Box::pin(async move {
+        let Ok(resp) = fut.await else {
+            return Ok(());
+        };
+        if resp.status() != 200 || resp.text_encoding().is_some() {
+            return Ok(());
+        }
+        let Ok(fresh) = resp.body().await else {
+            return Ok(());
+        };
+        if fresh != cached {
+            tracing::info!("带版本文本在服务器上已变化,更新缓存(下次启动生效): {url}");
+            let _ = workers::offload(move || write_cache_atomic(&path, &fresh)).await;
+        }
+        Ok(())
+    });
+    inner.borrow_mut().spawn_future(task);
+}
+
+/// 本进程里已经后台复核过的带版本文本(每个网址每次启动只复核一次)。
+static REVALIDATED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// 确定性失败(4xx):重试毫无意义,只会把一次 404 放大成 3 次请求 + 3 倍延迟。
 /// 5xx / 网络抖动 / 超时才值得重试(摩尔服务器抖起来确实靠重试救回)。
@@ -203,6 +362,73 @@ fn write_cache_atomic(path: &PathBuf, bytes: &[u8]) {
 
 impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
     fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+        // 接手预取:同一个绝对 URL、无请求头的 GET(引擎请求主 SWF 正是如此)。
+        if request.method() == NavigationMethod::Get
+            && request.body().is_none()
+            && request.headers().is_empty()
+            && !self.prefetched.borrow().is_empty()
+            && let Ok(abs) = self.inner.borrow().resolve_url(request.url())
+        {
+            let mut slots = self.prefetched.borrow_mut();
+            if let Some(index) = slots
+                .iter()
+                .position(|(key, ignore_query, _)| *key == prefetch_key(&abs, *ignore_query))
+            {
+                let (key, _, state) = slots.remove(index);
+                tracing::info!("接手预取的请求: {key}(引擎请求 {abs})");
+                return match state {
+                    Prefetch::Ready(result) => Box::pin(async move { result }),
+                    Prefetch::Pending(fut) => fut,
+                };
+            }
+        }
+        self.fetch_inner(request)
+    }
+
+    // ── 其余方法全部透传给内层(借用仅在调用期间)──
+    fn navigate_to_url(
+        &self,
+        url: &str,
+        target: &str,
+        vars_method: Option<(NavigationMethod, IndexMap<String, String>)>,
+    ) {
+        self.inner
+            .borrow()
+            .navigate_to_url(url, target, vars_method)
+    }
+
+    fn resolve_url(&self, url: &str) -> Result<Url, ParseError> {
+        self.inner.borrow().resolve_url(url)
+    }
+
+    fn spawn_future(&mut self, future: OwnedFuture<(), Error>) {
+        self.inner.borrow_mut().spawn_future(future)
+    }
+
+    fn pre_process_url(&self, url: Url) -> Url {
+        self.inner.borrow().pre_process_url(url)
+    }
+
+    fn connect_socket(
+        &mut self,
+        host: String,
+        port: u16,
+        timeout: Duration,
+        handle: SocketHandle,
+        receiver: Receiver<Vec<u8>>,
+        sender: Sender<SocketAction>,
+    ) {
+        self.inner
+            .borrow_mut()
+            .connect_socket(host, port, timeout, handle, receiver, sender)
+    }
+}
+
+impl<N: NavigatorBackend> CachingNavigator<N> {
+    fn fetch_inner(
+        &self,
+        request: Request,
+    ) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
         // 非 GET(POST 等)不幂等:既不缓存也不重试,原样透传(重试 POST 会重复提交)。
         if request.method() != NavigationMethod::Get {
             return self.inner.borrow().fetch(request);
@@ -265,6 +491,7 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
                 .is_some_and(|u| u.path().eq_ignore_ascii_case("/client.swf"));
         Box::pin(async move {
             // ① 缓存命中:读盘 +(SWF)解压都在后台线程完成,主线程只拿到可直接解析的字节。
+            let path_for_revalidate = cache_path.clone();
             if let Some(path) = cache_path.clone() {
                 let hit = workers::offload(move || {
                     let raw = std::fs::read(&path).ok()?;
@@ -277,6 +504,14 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
                     CACHE_HITS.fetch_add(1, Ordering::Relaxed);
                     CACHE_HIT_BYTES.fetch_add(disk_len as u64, Ordering::Relaxed);
                     tracing::debug!("缓存命中: {resp_url}");
+                    if let Some(abs) = abs.as_ref().filter(|u| is_versioned_text(u)) {
+                        revalidate(
+                            &inner,
+                            abs.to_string(),
+                            path_for_revalidate.clone(),
+                            bytes.clone(),
+                        );
+                    }
                     return Ok(
                         Box::new(CachedResponse::new(resp_url, bytes)) as Box<dyn SuccessResponse>
                     );
@@ -290,7 +525,11 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
             //    响应对象上,不能换成我们自己的包装)。
             enum Fetched {
                 Response(Box<dyn SuccessResponse>),
-                Body { final_url: String, bytes: Vec<u8> },
+                Body {
+                    final_url: String,
+                    bytes: Vec<u8>,
+                    has_charset: bool,
+                },
             }
             let want_body = cache_path.is_some() || is_root;
             let started = std::time::Instant::now();
@@ -303,13 +542,24 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
                 let fut = inner.borrow().fetch(req);
                 let url = url.clone();
                 let progress = last_progress.clone();
+                let attempt_started = std::time::Instant::now();
                 Box::pin(async move {
-                    let mut resp = fut.await?;
+                    let result = fut.await;
+                    // 首字节(响应头)时间,用于调对冲阈值(MOLE_NET_LOG=1 时打印)。
+                    if net_log_enabled() {
+                        tracing::info!(
+                            "[网络] 响应头 {:>5}ms {} {url}",
+                            attempt_started.elapsed().as_millis(),
+                            if result.is_ok() { "成功" } else { "失败" }
+                        );
+                    }
+                    let mut resp = result?;
                     progress.set(std::time::Instant::now());
                     if !want_body || resp.status() != 200 {
                         return Ok(Fetched::Response(resp)); // 非 200 不缓存,原样返回
                     }
                     let final_url = resp.url().to_string();
+                    let has_charset = resp.text_encoding().is_some();
                     let mut bytes = Vec::with_capacity(
                         resp.expected_length()
                             .ok()
@@ -327,7 +577,11 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
                             Err(error) => return Err(ErrorResponse { url, error }),
                         }
                     }
-                    Ok(Fetched::Body { final_url, bytes })
+                    Ok(Fetched::Body {
+                        final_url,
+                        bytes,
+                        has_charset,
+                    })
                 })
                     as std::pin::Pin<
                         Box<dyn std::future::Future<Output = Result<Fetched, ErrorResponse>>>,
@@ -402,7 +656,14 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
 
             match fetched {
                 Fetched::Response(resp) => Ok(resp),
-                Fetched::Body { final_url, bytes } => {
+                Fetched::Body {
+                    final_url,
+                    bytes,
+                    has_charset,
+                } => {
+                    // 文本文件:响应头带了字符集就不缓存(缓存返回的响应没有字符集,解码可能不同)。
+                    let cache_path = cache_path
+                        .filter(|_| !(has_charset && abs.as_ref().is_some_and(is_versioned_text)));
                     let Some(path) = cache_path else {
                         // root SWF:不进磁盘缓存(版本闸),body 已读完,直接交给引擎。
                         return Ok(Box::new(CachedResponse::new(final_url, bytes))
@@ -427,44 +688,6 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
                 }
             }
         })
-    }
-
-    // ── 其余方法全部透传给内层(借用仅在调用期间)──
-    fn navigate_to_url(
-        &self,
-        url: &str,
-        target: &str,
-        vars_method: Option<(NavigationMethod, IndexMap<String, String>)>,
-    ) {
-        self.inner
-            .borrow()
-            .navigate_to_url(url, target, vars_method)
-    }
-
-    fn resolve_url(&self, url: &str) -> Result<Url, ParseError> {
-        self.inner.borrow().resolve_url(url)
-    }
-
-    fn spawn_future(&mut self, future: OwnedFuture<(), Error>) {
-        self.inner.borrow_mut().spawn_future(future)
-    }
-
-    fn pre_process_url(&self, url: Url) -> Url {
-        self.inner.borrow().pre_process_url(url)
-    }
-
-    fn connect_socket(
-        &mut self,
-        host: String,
-        port: u16,
-        timeout: Duration,
-        handle: SocketHandle,
-        receiver: Receiver<Vec<u8>>,
-        sender: Sender<SocketAction>,
-    ) {
-        self.inner
-            .borrow_mut()
-            .connect_socket(host, port, timeout, handle, receiver, sender)
     }
 }
 
@@ -666,6 +889,24 @@ mod tests {
         out.extend(((body.len() + 8) as u32).to_le_bytes());
         out.extend(comp);
         out
+    }
+
+    #[test]
+    fn 带版本串的配置文本可缓存而版本闸不可() {
+        use super::is_versioned_text;
+        let host = crate::server::selected().host;
+        let u = |s: &str| url::Url::parse(&format!("http://{host}/{s}")).unwrap();
+        assert!(is_versioned_text(&u("config/Server.xml?i6ooed60")));
+        assert!(is_versioned_text(&u(
+            "resource/xml/logo/loadingWord.xml?i447fa34"
+        )));
+        assert!(is_versioned_text(&u("resource/xml/ext.xml?i816xnyw")));
+        // 版本闸:纯数字随机串,必须每次取最新
+        assert!(!is_versioned_text(&u("version/zzz_config.txt?5831196")));
+        assert!(!is_versioned_text(&u("config/Server.xml")));
+        assert!(!is_versioned_text(&u("config/Server.xml?v=1")));
+        assert!(!is_versioned_text(&u("config/Server.xml?I6OOED60")));
+        assert!(!is_versioned_text(&u("a/b.php?i6ooed60")));
     }
 
     #[test]
@@ -1015,6 +1256,76 @@ mod hedge_tests {
         );
         assert!(!ok);
         assert_eq!(calls.len(), 1, "{calls:?}");
+    }
+
+    #[test]
+    fn 预取的请求被同一网址的引擎请求接手且只发一次() {
+        let dir = std::env::temp_dir().join(format!("mole-prefetch-test-{}", std::process::id()));
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let nav = CachingNavigator::new(
+            MockNav {
+                scripts: vec![Script::Ok {
+                    header: MS(300),
+                    chunks: 2,
+                    gap: MS(10),
+                }],
+                calls: calls.clone(),
+            },
+            dir.clone(),
+        );
+        let url = format!("http://{}/Client.swf", server::selected().host);
+        nav.prefetch(&url);
+        assert_eq!(calls.borrow().len(), 1, "预取应立即发出请求");
+        // 别的网址不会接手预取
+        let other = format!("http://{}/other.xml", server::selected().host);
+        let _ = futures::executor::block_on(nav.fetch(Request::get(other)));
+        assert_eq!(nav.prefetched.borrow().len(), 1, "别的网址不应消费预取");
+        // 模拟"渲染器初始化"耗时 200ms,之后引擎请求同一网址
+        std::thread::sleep(MS(200));
+        let takeover = Instant::now();
+        let len = futures::executor::block_on(async {
+            nav.fetch(Request::get(url))
+                .await
+                .ok()?
+                .body()
+                .await
+                .ok()
+                .map(|b| b.len())
+        });
+        assert_eq!(len, Some(2 * 1024));
+        // 1 次预取 + 1 次 other.xml,主 SWF 没有被再发一次
+        assert_eq!(calls.borrow().len(), 2, "{:?}", calls.borrow());
+        // 预取的响应头(0.3 秒)早在前面的等待期间就到了:接手后只剩读正文,很快完成。
+        assert!(takeover.elapsed() < MS(150), "{:?}", takeover.elapsed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn 版本清单按路径预取且只被同路径接手() {
+        let dir = std::env::temp_dir().join(format!("mole-prefetch-q-{}", std::process::id()));
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let nav = CachingNavigator::new(
+            MockNav {
+                scripts: vec![Script::Ok {
+                    header: MS(100),
+                    chunks: 1,
+                    gap: MS(5),
+                }],
+                calls: calls.clone(),
+            },
+            dir.clone(),
+        );
+        let host = server::selected().host;
+        nav.prefetch_ignoring_query(&format!("http://{host}/version/zzz_config.txt"));
+        // 同路径、带随机串的引擎请求接手预取
+        let ok = futures::executor::block_on(nav.fetch(Request::get(format!(
+            "http://{host}/version/zzz_config.txt?7898149"
+        ))))
+        .is_ok();
+        assert!(ok);
+        assert_eq!(calls.borrow().len(), 1, "应接手预取而不是重新请求");
+        assert!(nav.prefetched.borrow().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
