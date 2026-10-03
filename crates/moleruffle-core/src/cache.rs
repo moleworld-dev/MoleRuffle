@@ -31,17 +31,22 @@ use crate::{server, workers};
 /// 失败重试次数(总尝试 = RETRIES + 1)。只对幂等 GET 生效。抖动网络下瞬时超时重试一次往往就成。
 const RETRIES: u32 = 2;
 
-/// ★对冲请求★:发往游戏服务器的 GET,距首次发起过了这些时间点还没拿到结果,就【并发】再发一次,
-/// 谁先成功用谁(其余的随 future 被丢弃而取消)。
+/// ★对冲请求★:发往游戏服务器的 GET 如果【停滞】了(一段时间内既没收到响应头、也没收到任何新数据),
+/// 就并发再发一次,谁先完整成功用谁(其余的随 future 被丢弃)。
 ///
 /// 为什么:这台服务器的典型病症是"同一个请求这次卡几十秒、紧接着再请求只要 0.6 秒"
 /// (实测 163 字节的 XML 0.6~7.6 秒,20KB 的 Client.swf 0.6~36 秒)。顺序重试只在【失败】后才触发,
 /// 对"卡着不回"无能为力,而 HTTP 层只设了连接超时、没有整体超时(怕误杀慢但正常的大文件)。
-/// 对冲不取消慢的那个,所以不会误杀;正常情况下 2.5 秒内就回来了,不会多发请求。
-const HEDGE_AT: [Duration; 3] = [
+///
+/// 判据是"停滞"而不是"总耗时":慢网络上正在稳定传输的大文件不会被重复下载(第一版按总耗时触发,
+/// 会把 1MB 的资源复制 2~4 份,审查指出)。时间表按"距最近一次发起"计,每档对冲独立计数,
+/// 失败重试不占对冲名额;主线程卡顿或切后台恢复后最多补发一个,不会把剩下几档一次全发出去。
+const STALL: Duration = Duration::from_millis(2500);
+/// 第 1/2/3 次对冲距上一次发起的最短间隔(还要同时满足"已停滞 STALL")。
+const HEDGE_GAP: [Duration; 3] = [
     Duration::from_millis(2500),
+    Duration::from_millis(3500),
     Duration::from_secs(6),
-    Duration::from_secs(12),
 ];
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -52,8 +57,13 @@ pub static CACHE_HITS: AtomicU64 = AtomicU64::new(0);
 pub static CACHE_MISSES: AtomicU64 = AtomicU64::new(0);
 pub static CACHE_HIT_BYTES: AtomicU64 = AtomicU64::new(0);
 pub static CACHE_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
-/// 触发过对冲(慢请求并发重发)的次数,观测用。
+/// 触发过对冲(停滞请求并发重发)的次数,观测用(见 [`hedge_summary`])。
 pub static HEDGED_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// 累计对冲次数(桌面/iOS 的 [perf] 行打印)。
+pub fn hedge_summary() -> u64 {
+    HEDGED_REQUESTS.load(Ordering::Relaxed)
+}
 
 /// MoleRuffle:大加载信号(P0 内存事故缓解)。navigator 一看到 .swf 请求(切场景/魔灵等
 /// 小游戏)就置位;壳的内存守卫下个 tick 消费它,抢在资源解码落地前 force_gc+清池腾余量。
@@ -94,7 +104,9 @@ impl<N> CachingNavigator<N> {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         url.hash(&mut h);
         let hex = format!("{:016x}", h.finish());
-        self.cache_dir.join(&hex[0..2]).join(format!("{hex}.swfcache"))
+        self.cache_dir
+            .join(&hex[0..2])
+            .join(format!("{hex}.swfcache"))
     }
 }
 
@@ -235,13 +247,17 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
             .ends_with(".swf");
         // 命中时也返回【绝对】URL,与未命中路径的 final_url 一致。这个 URL 会成为子影片的
         // loaderInfo.url;以前缓存几乎不生效所以没暴露,现在命中返回相对路径会让两条路径行为不一。
-        let resp_url = abs.as_ref().map(|u| u.to_string()).unwrap_or_else(|| url.clone());
+        let resp_url = abs
+            .as_ref()
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| url.clone());
         let inner = self.inner.clone();
         let headers = request.headers().clone();
         // 只对冲发往当前游戏服务器的请求(静态资源、配置、root SWF);登录等其它主机的 GET 保持
         // 原来的"失败后顺序重试",不并发重发。
-        let on_game_host =
-            abs.as_ref().is_some_and(|u| u.host_str() == Some(server::selected().host));
+        let on_game_host = abs
+            .as_ref()
+            .is_some_and(|u| u.host_str() == Some(server::selected().host));
         let hedge = on_game_host && request.body().is_none();
         let is_root = on_game_host
             && abs
@@ -261,20 +277,24 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
                     CACHE_HITS.fetch_add(1, Ordering::Relaxed);
                     CACHE_HIT_BYTES.fetch_add(disk_len as u64, Ordering::Relaxed);
                     tracing::debug!("缓存命中: {resp_url}");
-                    return Ok(Box::new(CachedResponse::new(resp_url, bytes)) as Box<dyn SuccessResponse>);
+                    return Ok(
+                        Box::new(CachedResponse::new(resp_url, bytes)) as Box<dyn SuccessResponse>
+                    );
                 }
                 CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
             }
 
-            // ② 未命中:走网络。GET 幂等:失败重试至多 RETRIES 次;发往游戏服务器的请求卡住时并发对冲
-            //    (见 HEDGE_AT)。要读 body 的(可缓存资源、root SWF)把"取头 + 读完 body"算作一次尝试,
-            //    这样 body 传到一半卡住也能被对冲救回;其余的拿到响应头就算成功,原样交回引擎
-            //    (XML/文本的字符集信息在原响应对象上,不能换成我们自己的包装)。
+            // ② 未命中:走网络。GET 幂等:失败重试至多 RETRIES 次;发往游戏服务器的请求停滞时并发对冲
+            //    (见 STALL / HEDGE_GAP)。要读 body 的(可缓存资源、root SWF)分块读取,每拿到响应头或一块
+            //    数据就记一次"进展";其余的拿到响应头就算成功,原样交回引擎(XML/文本的字符集信息在原
+            //    响应对象上,不能换成我们自己的包装)。
             enum Fetched {
                 Response(Box<dyn SuccessResponse>),
                 Body { final_url: String, bytes: Vec<u8> },
             }
             let want_body = cache_path.is_some() || is_root;
+            let started = std::time::Instant::now();
+            let last_progress = Rc::new(std::cell::Cell::new(started));
             let make_attempt = || {
                 // 每次尝试重建一个 GET 请求(原请求已被消费)
                 let mut req = Request::get(url.clone());
@@ -282,60 +302,99 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
                 // 借用只在同步的 fetch() 调用期间持有,拿到 future 后立刻释放,绝不跨 await
                 let fut = inner.borrow().fetch(req);
                 let url = url.clone();
+                let progress = last_progress.clone();
                 Box::pin(async move {
-                    let resp = fut.await?;
+                    let mut resp = fut.await?;
+                    progress.set(std::time::Instant::now());
                     if !want_body || resp.status() != 200 {
                         return Ok(Fetched::Response(resp)); // 非 200 不缓存,原样返回
                     }
                     let final_url = resp.url().to_string();
-                    match resp.body().await {
-                        Ok(bytes) => Ok(Fetched::Body { final_url, bytes }),
-                        Err(error) => Err(ErrorResponse { url, error }),
+                    let mut bytes = Vec::with_capacity(
+                        resp.expected_length()
+                            .ok()
+                            .flatten()
+                            .unwrap_or(0)
+                            .min(64 << 20) as usize,
+                    );
+                    loop {
+                        match resp.next_chunk().await {
+                            Ok(Some(chunk)) => {
+                                progress.set(std::time::Instant::now());
+                                bytes.extend_from_slice(&chunk);
+                            }
+                            Ok(None) => break,
+                            Err(error) => return Err(ErrorResponse { url, error }),
+                        }
                     }
-                }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<Fetched, ErrorResponse>>>>
+                    Ok(Fetched::Body { final_url, bytes })
+                })
+                    as std::pin::Pin<
+                        Box<dyn std::future::Future<Output = Result<Fetched, ErrorResponse>>>,
+                    >
             };
 
             use futures::future::{Either, select};
             use futures::stream::{FuturesUnordered, StreamExt};
-            let started = std::time::Instant::now();
             let mut in_flight = FuturesUnordered::new();
             in_flight.push(make_attempt());
-            let mut launched = 1usize;
+            let mut last_launch = started;
+            let mut hedges = 0usize;
             let mut failures = 0u32;
+            // 收到过确定性失败(4xx)就不再对冲:同一个资源再发也是 4xx。
+            let mut no_more_hedge = false;
+            let mut last_err: Option<ErrorResponse> = None;
             let fetched = loop {
-                // 下一次对冲的时间点;不对冲(别的主机)或名额用完就只等在途的尝试。
-                let hedge_timer = match (hedge, HEDGE_AT.get(launched - 1)) {
-                    (true, Some(at)) => Either::Left(async_io::Timer::at(started + *at)),
+                // 下一次对冲的时刻:距最近一次发起满 HEDGE_GAP[hedges],且距最近一次进展满 STALL。
+                // 不对冲(别的主机)、名额用完、或收到过 4xx 就只等在途的尝试。
+                let hedge_timer = match HEDGE_GAP.get(hedges) {
+                    Some(gap) if hedge && !no_more_hedge => {
+                        let due = (last_launch + *gap).max(last_progress.get() + STALL);
+                        Either::Left(async_io::Timer::at(due))
+                    }
                     _ => Either::Right(futures::future::pending::<std::time::Instant>()),
                 };
                 match select(in_flight.next(), hedge_timer).await {
                     Either::Left((Some(Ok(fetched)), _)) => break fetched,
                     Either::Left((Some(Err(err)), _)) => {
-                        // 4xx 是确定性失败(资源真不存在),重试只是把一次 404 放大成 3 次请求。
                         failures += 1;
-                        if failures > RETRIES || !is_worth_retry(&err) {
+                        let deterministic = !is_worth_retry(&err);
+                        no_more_hedge |= deterministic;
+                        if !in_flight.is_empty() {
+                            // 还有别的尝试在途(可能正在正常传输),等它们,不因为某个副本失败就判死。
+                            last_err = Some(err);
+                            continue;
+                        }
+                        // 4xx 是确定性失败(资源真不存在),重试只是把一次 404 放大成 3 次请求。
+                        if failures > RETRIES || deterministic {
                             return Err(err);
                         }
                         tracing::debug!("拉取失败,重试 {failures}/{RETRIES}: {url}");
-                        if in_flight.is_empty() {
-                            in_flight.push(make_attempt());
-                            launched += 1;
-                        }
+                        in_flight.push(make_attempt());
+                        last_launch = std::time::Instant::now();
                     }
                     Either::Left((None, _)) => {
-                        // 不会发生(失败分支保证至少留一个在途),以防万一补一个。
-                        in_flight.push(make_attempt());
-                        launched += 1;
+                        // 不会发生(失败分支保证要么返回、要么留一个在途);以防万一按失败处理。
+                        return Err(last_err.take().unwrap_or_else(|| ErrorResponse {
+                            url: url.clone(),
+                            error: Error::FetchError("没有在途的请求".into()),
+                        }));
                     }
-                    Either::Right(_) => {
+                    Either::Right((now, _)) => {
+                        // 计时器到点期间可能刚有进展,再确认一次确实停滞了。
+                        if now < last_progress.get() + STALL {
+                            continue;
+                        }
+                        hedges += 1;
                         tracing::info!(
-                            "请求 {:.1} 秒没回,并发再发一次(第 {} 个): {url}",
+                            "请求停滞 {:.1} 秒(距发起 {:.1} 秒),并发再发一次(第 {} 个副本): {url}",
+                            last_progress.get().elapsed().as_secs_f32(),
                             started.elapsed().as_secs_f32(),
-                            launched + 1
+                            hedges
                         );
                         HEDGED_REQUESTS.fetch_add(1, Ordering::Relaxed);
                         in_flight.push(make_attempt());
-                        launched += 1;
+                        last_launch = now;
                     }
                 }
             };
@@ -377,7 +436,9 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
         target: &str,
         vars_method: Option<(NavigationMethod, IndexMap<String, String>)>,
     ) {
-        self.inner.borrow().navigate_to_url(url, target, vars_method)
+        self.inner
+            .borrow()
+            .navigate_to_url(url, target, vars_method)
     }
 
     fn resolve_url(&self, url: &str) -> Result<Url, ParseError> {
@@ -417,7 +478,11 @@ struct CachedResponse {
 
 impl CachedResponse {
     fn new(url: String, bytes: Vec<u8>) -> Self {
-        Self { url, bytes, chunk_done: false }
+        Self {
+            url,
+            bytes,
+            chunk_done: false,
+        }
     }
 }
 
@@ -511,9 +576,13 @@ pub fn trim_cache_in_background() {
             let mut total: u64 = 0;
             let mut orphans = 0usize;
             // 两层结构:<dir>/<hash前2位>/<hash>.swfcache
-            let Ok(buckets) = std::fs::read_dir(&dir) else { return };
+            let Ok(buckets) = std::fs::read_dir(&dir) else {
+                return;
+            };
             for bucket in buckets.flatten() {
-                let Ok(files) = std::fs::read_dir(bucket.path()) else { continue };
+                let Ok(files) = std::fs::read_dir(bucket.path()) else {
+                    continue;
+                };
                 for f in files.flatten() {
                     let path = f.path();
                     let Ok(md) = f.metadata() else { continue };
@@ -634,12 +703,18 @@ mod tests {
     fn 本机缓存里的真实摩尔资源也一致() {
         // 有缓存就验,没有就跳过(CI 上没有)。
         let dir = super::cache_root().join("official");
-        let Ok(buckets) = std::fs::read_dir(&dir) else { return };
+        let Ok(buckets) = std::fs::read_dir(&dir) else {
+            return;
+        };
         let mut checked = 0;
         for b in buckets.flatten() {
-            let Ok(files) = std::fs::read_dir(b.path()) else { continue };
+            let Ok(files) = std::fs::read_dir(b.path()) else {
+                continue;
+            };
             for f in files.flatten() {
-                let Ok(raw) = std::fs::read(f.path()) else { continue };
+                let Ok(raw) = std::fs::read(f.path()) else {
+                    continue;
+                };
                 if raw.len() < 8 || &raw[0..3] != b"CWS" {
                     continue;
                 }
@@ -651,5 +726,307 @@ mod tests {
             }
         }
         eprintln!("真实 SWF 校验 {checked} 个");
+    }
+}
+
+/// 对冲/重试逻辑的时序单测:用假的下层导航器按剧本返回(真实计时,单个用例 3~10 秒)。
+#[cfg(test)]
+mod hedge_tests {
+    use super::*;
+    use std::time::Instant;
+
+    /// 一次尝试的剧本。
+    #[derive(Clone)]
+    enum Script {
+        /// 等 `header` 后回 200,正文分 `chunks` 块、每块间隔 `gap`。
+        Ok {
+            header: Duration,
+            chunks: usize,
+            gap: Duration,
+        },
+        /// 等 `delay` 后失败;`status` 为 0 表示网络错误,否则是 HTTP 状态码。
+        Fail { delay: Duration, status: u16 },
+        /// 永远不回。
+        Hang,
+    }
+
+    struct MockNav {
+        /// 第 i 次 fetch 用第 i 个剧本(超出则重复最后一个)。
+        scripts: Vec<Script>,
+        calls: Rc<RefCell<Vec<Instant>>>,
+    }
+
+    impl NavigatorBackend for MockNav {
+        fn navigate_to_url(
+            &self,
+            _url: &str,
+            _target: &str,
+            _vars_method: Option<(NavigationMethod, IndexMap<String, String>)>,
+        ) {
+        }
+
+        fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+            let mut calls = self.calls.borrow_mut();
+            let script = self.scripts[calls.len().min(self.scripts.len() - 1)].clone();
+            calls.push(Instant::now());
+            let url = request.url().to_string();
+            Box::pin(async move {
+                match script {
+                    Script::Ok {
+                        header,
+                        chunks,
+                        gap,
+                    } => {
+                        async_io::Timer::after(header).await;
+                        Ok(Box::new(MockResp {
+                            url,
+                            chunks,
+                            gap,
+                            sent: 0,
+                        }) as Box<dyn SuccessResponse>)
+                    }
+                    Script::Fail { delay, status } => {
+                        async_io::Timer::after(delay).await;
+                        let error = if status == 0 {
+                            Error::FetchError("连接断开".into())
+                        } else {
+                            Error::HttpNotOk(url.clone(), status, false, 0)
+                        };
+                        Err(ErrorResponse { url, error })
+                    }
+                    Script::Hang => futures::future::pending().await,
+                }
+            })
+        }
+
+        fn resolve_url(&self, url: &str) -> Result<Url, ParseError> {
+            Url::parse(url)
+        }
+
+        fn spawn_future(&mut self, _future: OwnedFuture<(), Error>) {}
+
+        fn pre_process_url(&self, url: Url) -> Url {
+            url
+        }
+
+        fn connect_socket(
+            &mut self,
+            _host: String,
+            _port: u16,
+            _timeout: Duration,
+            _handle: SocketHandle,
+            _receiver: Receiver<Vec<u8>>,
+            _sender: Sender<SocketAction>,
+        ) {
+        }
+    }
+
+    struct MockResp {
+        url: String,
+        chunks: usize,
+        gap: Duration,
+        sent: usize,
+    }
+
+    impl SuccessResponse for MockResp {
+        fn url(&self) -> Cow<'_, str> {
+            Cow::Borrowed(&self.url)
+        }
+        fn set_url(&mut self, url: String) {
+            self.url = url;
+        }
+        fn body(self: Box<Self>) -> OwnedFuture<Vec<u8>, Error> {
+            let n = self.chunks * 1024;
+            Box::pin(async move { Ok(vec![b'x'; n]) })
+        }
+        fn text_encoding(&self) -> Option<&'static Encoding> {
+            None
+        }
+        fn status(&self) -> u16 {
+            200
+        }
+        fn redirected(&self) -> bool {
+            false
+        }
+        fn next_chunk(&mut self) -> OwnedFuture<Option<Vec<u8>>, Error> {
+            if self.sent >= self.chunks {
+                return Box::pin(async { Ok(None) });
+            }
+            self.sent += 1;
+            let gap = self.gap;
+            Box::pin(async move {
+                async_io::Timer::after(gap).await;
+                Ok(Some(vec![b'x'; 1024]))
+            })
+        }
+        fn expected_length(&self) -> Result<Option<u64>, Error> {
+            Ok(Some((self.chunks * 1024) as u64))
+        }
+    }
+
+    /// 跑一次 fetch,返回 (是否成功, 正文长度, 下层被调用的相对时刻(秒), 总耗时(秒))。
+    fn run(scripts: Vec<Script>, path: &str) -> (bool, usize, Vec<f32>, f32) {
+        let dir = std::env::temp_dir().join(format!(
+            "mole-hedge-test-{}-{}",
+            std::process::id(),
+            path.replace('/', "_")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let nav = CachingNavigator::new(
+            MockNav {
+                scripts,
+                calls: calls.clone(),
+            },
+            dir.clone(),
+        );
+        let url = format!("http://{}/{path}", server::selected().host);
+        let start = Instant::now();
+        let result = futures::executor::block_on(async {
+            match nav.fetch(Request::get(url)).await {
+                Ok(resp) => resp.body().await.ok().map(|b| b.len()),
+                Err(_) => None,
+            }
+        });
+        let elapsed = start.elapsed().as_secs_f32();
+        let at = calls
+            .borrow()
+            .iter()
+            .map(|t| t.duration_since(start).as_secs_f32())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        (result.is_some(), result.unwrap_or(0), at, elapsed)
+    }
+
+    const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    #[test]
+    fn 慢但持续传输的大文件不对冲() {
+        // 响应头 0.3 秒到,之后每 0.4 秒一块、共 15 块(总计约 6.3 秒),从未停滞 2.5 秒。
+        let (ok, len, calls, _) = run(
+            vec![Script::Ok {
+                header: MS(300),
+                chunks: 15,
+                gap: MS(400),
+            }],
+            "slow/big.swf",
+        );
+        assert!(ok);
+        assert_eq!(len, 15 * 1024);
+        assert_eq!(calls.len(), 1, "不该对冲:{calls:?}");
+    }
+
+    #[test]
+    fn 卡住不回时约二点五秒对冲且副本成功() {
+        let (ok, _, calls, elapsed) = run(
+            vec![
+                Script::Hang,
+                Script::Ok {
+                    header: MS(100),
+                    chunks: 2,
+                    gap: MS(10),
+                },
+            ],
+            "stall/a.swf",
+        );
+        assert!(ok);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!((2.4..3.2).contains(&calls[1]), "对冲时刻 {calls:?}");
+        assert!(elapsed < 3.5, "总耗时 {elapsed}");
+    }
+
+    #[test]
+    fn 传输中途卡住也会对冲() {
+        // 第一个:头很快到,发两块后卡死(第三块间隔 60 秒);副本正常。
+        let (ok, _, calls, elapsed) = run(
+            vec![
+                Script::Ok {
+                    header: MS(100),
+                    chunks: 3,
+                    gap: Duration::from_secs(60),
+                },
+                Script::Ok {
+                    header: MS(100),
+                    chunks: 1,
+                    gap: MS(10),
+                },
+            ],
+            "stall/b.swf",
+        );
+        assert!(ok);
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(elapsed < 4.0, "总耗时 {elapsed}");
+    }
+
+    #[test]
+    fn 副本回四百零四不会杀掉仍在传输的原请求() {
+        // 原请求卡住 3 秒没头(触发对冲),然后正常传完;副本立刻回 404。
+        let (ok, len, calls, _) = run(
+            vec![
+                Script::Ok {
+                    header: MS(3000),
+                    chunks: 2,
+                    gap: MS(10),
+                },
+                Script::Fail {
+                    delay: MS(50),
+                    status: 404,
+                },
+            ],
+            "replica404/a.swf",
+        );
+        assert!(ok, "原请求应当成功:{calls:?}");
+        assert_eq!(len, 2 * 1024);
+        assert_eq!(calls.len(), 2, "收到 4xx 后不应再对冲:{calls:?}");
+    }
+
+    #[test]
+    fn 快速失败后立即重试且对冲计时从重试起算() {
+        // 第一次 0.1 秒就断;重试的那次卡住;它应在重试后约 2.5 秒被对冲(而不是从首发起算的 6 秒档)。
+        let (ok, _, calls, _) = run(
+            vec![
+                Script::Fail {
+                    delay: MS(100),
+                    status: 0,
+                },
+                Script::Hang,
+                Script::Ok {
+                    header: MS(50),
+                    chunks: 1,
+                    gap: MS(10),
+                },
+            ],
+            "retry/a.swf",
+        );
+        assert!(ok);
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        let since_retry = calls[2] - calls[1];
+        assert!((2.4..3.2).contains(&since_retry), "{calls:?}");
+    }
+
+    #[test]
+    fn 四百零四只请求一次() {
+        let (ok, _, calls, _) = run(
+            vec![Script::Fail {
+                delay: MS(50),
+                status: 404,
+            }],
+            "missing/a.swf",
+        );
+        assert!(!ok);
+        assert_eq!(calls.len(), 1, "{calls:?}");
+    }
+
+    #[test]
+    fn 一直失败在重试用尽后报错() {
+        let (ok, _, calls, _) = run(
+            vec![Script::Fail {
+                delay: MS(50),
+                status: 503,
+            }],
+            "flaky/a.swf",
+        );
+        assert!(!ok);
+        assert_eq!(calls.len() as u32, RETRIES + 1, "{calls:?}");
     }
 }

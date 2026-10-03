@@ -37,13 +37,6 @@ use winit::window::{Window, WindowId};
 
 use moleruffle_core as mole;
 
-mod keymap;
-/// 虚拟手柄自适应布局(纯函数;iOS 用,安卓壳按此移植;桌面仅跑单测)。
-#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
-mod pad_layout;
-/// iOS 纯触摸复制/粘贴工具条(原生 UIView 叠层)。
-#[cfg(target_os = "ios")]
-mod ios_textbar;
 /// iOS 绿色多行调试 HUD(原生 UILabel 叠层,不吃触摸)。
 #[cfg(target_os = "ios")]
 #[allow(dead_code)]
@@ -51,6 +44,13 @@ mod ios_debug_hud;
 /// iOS 屏幕虚拟手柄(方向键+空格+切换钮,原生叠层 + 坐标命中注入按键)。
 #[cfg(target_os = "ios")]
 mod ios_gamepad;
+/// iOS 纯触摸复制/粘贴工具条(原生 UIView 叠层)。
+#[cfg(target_os = "ios")]
+mod ios_textbar;
+mod keymap;
+/// 虚拟手柄自适应布局(纯函数;iOS 用,安卓壳按此移植;桌面仅跑单测)。
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+mod pad_layout;
 
 /// winit 自定义事件:把 Ruffle 的异步任务调度回事件循环线程执行。
 enum UserEvent {
@@ -130,6 +130,9 @@ struct App {
     perf_dirty_last: [usize; 7],
     /// [perf] 上次取样时烘焙记忆统计的累计值(见 ruffle_render::evict::CAB_MEMO_STATS)。
     perf_memo_last: [usize; 4],
+    /// iOS [perf] 行的统计窗口起点(按墙钟出行)。
+    #[cfg(target_os = "ios")]
+    perf_window_start: Instant,
     /// 延迟测量:最近一次尚未被渲染消费的输入(点击/按键)时刻。
     /// 下一次 redraw_now 消费并打印"输入→本帧提交"的客户端延迟(不含 present 与服务器往返)。
     #[cfg(not(target_os = "ios"))]
@@ -309,6 +312,8 @@ impl App {
             perf_kind_last: [0; ruffle_render::evict::PASS_KIND_COUNT],
             perf_dirty_last: [0; 7],
             perf_memo_last: [0; 4],
+            #[cfg(target_os = "ios")]
+            perf_window_start: Instant::now(),
             #[cfg(not(target_os = "ios"))]
             pending_input: None,
             #[cfg(target_os = "ios")]
@@ -333,7 +338,8 @@ impl App {
             use ruffle_render_wgpu::descriptors::Descriptors;
             use ruffle_render_wgpu::target::SwapChainTarget;
 
-            let instance = create_wgpu_instance(wgpu::Backends::PRIMARY, wgpu::BackendOptions::default());
+            let instance =
+                create_wgpu_instance(wgpu::Backends::PRIMARY, wgpu::BackendOptions::default());
             let surface = unsafe {
                 instance
                     .create_surface_unsafe(
@@ -359,8 +365,10 @@ impl App {
             let mut limits = wgpu::Limits::downlevel_webgl2_defaults();
             limits = limits.using_resolution(adapter.limits());
             limits = limits.using_alignment(adapter.limits());
-            limits.max_uniform_buffer_binding_size = adapter.limits().max_uniform_buffer_binding_size;
-            limits.max_inter_stage_shader_components = adapter.limits().max_inter_stage_shader_components;
+            limits.max_uniform_buffer_binding_size =
+                adapter.limits().max_uniform_buffer_binding_size;
+            limits.max_inter_stage_shader_components =
+                adapter.limits().max_inter_stage_shader_components;
             limits.max_color_attachments = 4;
             limits.max_texture_dimension_2d = limits.max_texture_dimension_2d.min(4096);
 
@@ -382,21 +390,24 @@ impl App {
             #[cfg(not(target_os = "ios"))]
             let memory_hints = wgpu::MemoryHints::Performance;
 
-            let (device, queue) = futures::executor::block_on(adapter.request_device(
-                &wgpu::DeviceDescriptor {
+            let (device, queue) =
+                futures::executor::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
                     label: None,
                     required_features: features,
                     required_limits: limits,
                     memory_hints,
                     trace: wgpu::Trace::Off,
                     experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                },
-            ))
-            .expect("创建 wgpu device 失败");
+                }))
+                .expect("创建 wgpu device 失败");
 
             let descriptors = Descriptors::new(instance, adapter, device, queue);
-            let target =
-                SwapChainTarget::new(surface, &descriptors.adapter, (width, height), &descriptors.device);
+            let target = SwapChainTarget::new(
+                surface,
+                &descriptors.adapter,
+                (width, height),
+                &descriptors.device,
+            );
             let descriptors = std::sync::Arc::new(descriptors);
             // 后台预建滤镜/离屏表面的渲染管线(ruffle-fork descriptors.rs)。不预建的话它们在登录页
             // 首次出现发光/模糊时在主线程上编译,卡 100~170ms;现在主 SWF 还在下载,正好空闲。
@@ -407,8 +418,8 @@ impl App {
                     mole::default_stage_quality(),
                 );
             }
-            let backend = WgpuRenderBackend::new(descriptors, target)
-                .expect("创建 wgpu 渲染后端失败");
+            let backend =
+                WgpuRenderBackend::new(descriptors, target).expect("创建 wgpu 渲染后端失败");
             (backend, render_api)
         };
 
@@ -567,7 +578,11 @@ impl App {
                 let inner = w.inner_size();
                 tracing::info!(
                     "viewport 同步 render={}x{} (inner={}x{}) scale={}",
-                    width, height, inner.width, inner.height, scale
+                    width,
+                    height,
+                    inner.width,
+                    inner.height,
+                    scale
                 );
                 self.with_player(|p| {
                     p.set_viewport_dimensions(ViewportDimensions {
@@ -594,9 +609,7 @@ impl App {
             if let Some(t0) = self.pending_input.take() {
                 let total_ms = t0.elapsed().as_secs_f64() * 1000.0;
                 let render_ms = self.last_render_us as f64 / 1000.0;
-                tracing::info!(
-                    "[延迟] 输入→本帧提交 {total_ms:.1}ms(渲染占 {render_ms:.1}ms)"
-                );
+                tracing::info!("[延迟] 输入→本帧提交 {total_ms:.1}ms(渲染占 {render_ms:.1}ms)");
             }
         }
         self.frames += 1;
@@ -617,7 +630,9 @@ impl App {
             let mode = gp.layout(sw, sh, scale, safe);
             tracing::info!(
                 "叠层重排:{sw:.0}x{sh:.0}pt 安全区 左{:.0}右{:.0}下{:.0} → 手柄{mode:?}",
-                safe.left, safe.right, safe.bottom
+                safe.left,
+                safe.right,
+                safe.bottom
             );
         }
         if self.kbd_on {
@@ -686,17 +701,28 @@ impl App {
         use std::sync::atomic::Ordering::Relaxed;
         let dt = since.as_secs_f64().max(0.001);
         let off_now = ruffle_render::evict::OFFSCREEN_BYTES.load(Relaxed);
-        let pool_mb_s = (off_now.saturating_sub(self.last_offscreen)) as f64 / dt / (1024.0 * 1024.0);
+        let pool_mb_s =
+            (off_now.saturating_sub(self.last_offscreen)) as f64 / dt / (1024.0 * 1024.0);
         self.last_offscreen = off_now;
         let empty_now = ruffle_render::evict::EMPTY_BYTES.load(Relaxed);
-        let empty_mb_s = (empty_now.saturating_sub(self.last_empty)) as f64 / dt / (1024.0 * 1024.0);
+        let empty_mb_s =
+            (empty_now.saturating_sub(self.last_empty)) as f64 / dt / (1024.0 * 1024.0);
         self.last_empty = empty_now;
-        tracing::info!("[mem] 软件 {foot}MB | 池churn {pool_mb_s:.0} | emptychurn {empty_mb_s:.0} MB/s | 余量 {avail}MB");
+        tracing::info!(
+            "[mem] 软件 {foot}MB | 池churn {pool_mb_s:.0} | emptychurn {empty_mb_s:.0} MB/s | 余量 {avail}MB"
+        );
         // 与桌面同款的渲染统计(约每 2 秒一行)。用户在手机上玩的时候,从电脑读设备控制台
         // 就能拿到游戏内各场景的通道数 / 来源 / 脏矩形命中情况。
-        if self.perf_render_n >= 40 {
+        // 按墙钟每 ~2 秒一行;FPS 与渲染统计用同一个窗口(锁帧挂机时帧数很少,按帧数凑会跨很久)。
+        let window = self.perf_window_start.elapsed();
+        if window >= Duration::from_secs(2) && self.perf_render_n > 0 {
+            let window_fps = self.perf_render_n as f64 / window.as_secs_f64();
             let render = self.perf_render_stats();
-            tracing::info!("[perf] FPS {fps:>4} | {render} | 足迹 {foot}MB 余量 {avail}MB");
+            self.perf_window_start = Instant::now();
+            tracing::info!(
+                "[perf] FPS {window_fps:>4.0} | {render} | 对冲 {} | 足迹 {foot}MB 余量 {avail}MB",
+                mole::cache::hedge_summary()
+            );
         }
 
         // 刷新 HUD 文本。
@@ -820,7 +846,14 @@ impl ApplicationHandler<UserEvent> for App {
                 tracing::warn!("iOS 文本工具条创建失败");
             }
             self.hud = ios_debug_hud::DebugHud::new(&window);
-            tracing::info!("iOS 调试 HUD {}", if self.hud.is_some() { "已创建" } else { "创建失败" });
+            tracing::info!(
+                "iOS 调试 HUD {}",
+                if self.hud.is_some() {
+                    "已创建"
+                } else {
+                    "创建失败"
+                }
+            );
             // Phase 2-A 实验:开启定期逐出,观测真实 footprint 是否随常驻回落。
             ruffle_render::evict::set_evict(IOS_EVICT_EXPERIMENT);
             // 屏幕虚拟手柄(方向键+空格+切换钮),初始隐藏面板、切换钮常驻。
@@ -914,7 +947,11 @@ impl ApplicationHandler<UserEvent> for App {
                     self.viewport = (width, height);
                     tracing::info!(
                         "Resized: render={}x{} (inner={}x{}) scale={}",
-                        width, height, inner.width, inner.height, scale
+                        width,
+                        height,
+                        inner.width,
+                        inner.height,
+                        scale
                     );
                     self.with_player(|p| {
                         p.set_viewport_dimensions(ViewportDimensions {
@@ -969,9 +1006,7 @@ impl ApplicationHandler<UserEvent> for App {
                                 TextAction::Cut => (TextControlCode::Cut, "剪切"),
                                 TextAction::SelectAll => (TextControlCode::SelectAll, "全选"),
                             };
-                            self.with_player(|p| {
-                                p.handle_event(PlayerEvent::TextControl { code })
-                            });
+                            self.with_player(|p| p.handle_event(PlayerEvent::TextControl { code }));
                             tracing::info!("文本工具条:{name}");
                         }
                         return;
@@ -999,14 +1034,18 @@ impl ApplicationHandler<UserEvent> for App {
                                 Some(ios_gamepad::GamepadHit::Key(k)) => {
                                     self.gamepad_touches.insert(id, k);
                                     let key = keymap::gamepad_key_descriptor(k);
-                                    self.with_player(|p| p.handle_event(PlayerEvent::KeyDown { key }));
+                                    self.with_player(|p| {
+                                        p.handle_event(PlayerEvent::KeyDown { key })
+                                    });
                                 }
                                 None => {}
                             },
                             TouchPhase::Ended | TouchPhase::Cancelled => {
                                 if let Some(k) = self.gamepad_touches.remove(&id) {
                                     let key = keymap::gamepad_key_descriptor(k);
-                                    self.with_player(|p| p.handle_event(PlayerEvent::KeyUp { key }));
+                                    self.with_player(|p| {
+                                        p.handle_event(PlayerEvent::KeyUp { key })
+                                    });
                                 }
                             }
                             TouchPhase::Moved => { /* 按住中,吞掉,保持 KeyDown */ }
@@ -1050,7 +1089,10 @@ impl ApplicationHandler<UserEvent> for App {
                     MouseButton::Middle => RuffleButton::Middle,
                     _ => RuffleButton::Unknown,
                 };
-                let (x, y) = (self.mouse_pos.x * RENDER_SCALE, self.mouse_pos.y * RENDER_SCALE);
+                let (x, y) = (
+                    self.mouse_pos.x * RENDER_SCALE,
+                    self.mouse_pos.y * RENDER_SCALE,
+                );
                 #[cfg(not(target_os = "ios"))]
                 if state == ElementState::Pressed {
                     self.pending_input = Some(Instant::now());
@@ -1090,7 +1132,8 @@ impl ApplicationHandler<UserEvent> for App {
                 self.with_player(|p| match event.state {
                     ElementState::Pressed => {
                         p.handle_event(PlayerEvent::KeyDown { key });
-                        if let Some(code) = keymap::winit_to_ruffle_text_control(&event, modifiers) {
+                        if let Some(code) = keymap::winit_to_ruffle_text_control(&event, modifiers)
+                        {
                             // 复制/粘贴/剪切/全选/回车/光标移动等
                             p.handle_event(PlayerEvent::TextControl { code });
                         } else if let Some(text) = &event.text {
@@ -1287,7 +1330,8 @@ impl ApplicationHandler<UserEvent> for App {
                 let hit_pct = if ch + cm > 0 { ch * 100 / (ch + cm) } else { 0 };
                 let cache_mb = chb / (1024 * 1024);
                 tracing::info!(
-                    "[perf] FPS {fps:>4.0} | {render} | 离屏churn 池{pool_mb_s:>4.0}/empty{empty_mb_s:>4.0} MB/s | 常驻 {res_mb}MB | 缓存命中 {ch}/{}({hit_pct}%) 省下载 {cache_mb}MB",
+                    "[perf] FPS {fps:>4.0} | {render} | 对冲 {} | 离屏churn 池{pool_mb_s:>4.0}/empty{empty_mb_s:>4.0} MB/s | 常驻 {res_mb}MB | 缓存命中 {ch}/{}({hit_pct}%) 省下载 {cache_mb}MB",
+                    mole::cache::hedge_summary(),
                     ch + cm
                 );
             }
@@ -1339,25 +1383,40 @@ pub fn run(event_loop: EventLoop<UserEvent>) -> anyhow::Result<()> {
 
 /// 桌面 / iOS 入口(bin 的 `fn main()` 调它)。安卓不走这里(见 `android_main`)。
 pub fn desktop_main() -> anyhow::Result<()> {
+    // ★第一件事★:读开关文件、设各项默认环境变量。必须在任何线程创建之前(见 init_process_env)。
+    mole::init_process_env();
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         // winit=error:iOS 上用 Poll 驱动重绘时,winit 会在 ProcessingRedraws 阶段收到 AboutToWait,
         // 每帧刷屏式 warn("processing non RedrawRequested event ...")。这是该 winit 版本 iOS
         // 重绘模型的固有副产物(request_redraw 只能在事件阶段调,不能在 RedrawRequested 里调),
         // 无害但拖累帧率,这里压到 error 消除其每帧 {:#?} 格式化开销。
-        tracing_subscriber::EnvFilter::new("warn,winit=error,ruffle=info,avm_trace=info,moleruffle=info")
+        tracing_subscriber::EnvFilter::new(
+            "warn,winit=error,ruffle=info,avm_trace=info,moleruffle=info",
+        )
     });
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     // 渲染快路径(ruffle-fork 里全部默认关、与上游一致;这里一次性全开),随后 init_from_env
     // 读环境变量做单项覆盖(MOLE_XFORM_64K / MOLE_CAB_BLIT / ... =0 关),用于对照和紧急回退。
     // 必须早于创建渲染后端(变换缓冲的容量在那时定下)。
+    for applied in mole::FLAGS_APPLIED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        tracing::info!("开关文件 {applied}");
+    }
     ruffle_render::evict::set_fast_paths(true);
     // 纹理逐出开关:读 MOLE_TEXTURE_EVICT(Phase 1 不设=保持关=行为同现状)。
     ruffle_render::evict::init_from_env();
     apply_pool_budget();
 
     let srv = mole::server::selected();
-    tracing::info!("MoleRuffle 启动 | 服务器 {} | 加载 {}", srv.name, srv.swf_url);
+    tracing::info!(
+        "MoleRuffle 启动 | 服务器 {} | 加载 {}",
+        srv.name,
+        srv.swf_url
+    );
     // 缓存维护(独立线程,不卡事件循环):清 .tmp 孤儿 + 超预算时按最旧删。
     mole::cache::trim_cache_in_background();
 
@@ -1370,6 +1429,8 @@ pub fn desktop_main() -> anyhow::Result<()> {
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(app: winit::platform::android::activity::AndroidApp) {
+    // ★第一件事★:同 desktop_main。
+    mole::init_process_env();
     use winit::platform::android::EventLoopBuilderExtAndroid;
 
     // tracing → logcat(paranoid-android 的 AndroidLog 写入器)。
@@ -1380,17 +1441,30 @@ fn android_main(app: winit::platform::android::activity::AndroidApp) {
             "warn,ruffle=info,moleruffle=info,moleruffle_desktop=info",
         ))
         .with(
-            tracing_subscriber::fmt::layer().with_ansi(false).with_writer(
-                paranoid_android::AndroidLogMakeWriter::new("moleruffle".to_owned()),
-            ),
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(paranoid_android::AndroidLogMakeWriter::new(
+                    "moleruffle".to_owned(),
+                )),
         )
         .try_init();
 
+    for applied in mole::FLAGS_APPLIED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
+        tracing::info!("开关文件 {applied}");
+    }
     ruffle_render::evict::set_fast_paths(true);
     ruffle_render::evict::init_from_env();
     apply_pool_budget();
     let srv = mole::server::selected();
-    tracing::info!("MoleRuffle 安卓启动 | 服务器 {} | 加载 {}", srv.name, srv.swf_url);
+    tracing::info!(
+        "MoleRuffle 安卓启动 | 服务器 {} | 加载 {}",
+        srv.name,
+        srv.swf_url
+    );
     mole::cache::trim_cache_in_background();
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
