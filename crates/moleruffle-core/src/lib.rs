@@ -107,6 +107,9 @@ pub fn init_process_env() {
         set_default("MOLE_METAL_SINGLE_CB", "1");
         #[cfg(any(target_os = "ios", target_os = "android"))]
         set_default("MOLE_LETTERBOX_FORCED_ALIGN", "1");
+        // 位图后台预解码(fork 快路径):解好未取的像素暂存在内存里,手机内存紧,预算减半(桌面 64MB)。
+        #[cfg(any(target_os = "ios", target_os = "android"))]
+        set_default("MOLE_PREDECODE_MB", "32");
     });
 }
 
@@ -180,6 +183,7 @@ const FLAG_KEYS: &[&str] = &[
     "MOLE_CAB_BLIT",
     "MOLE_XFORM_64K",
     "MOLE_LAZY_SHAPE",
+    "MOLE_BITMAP_PREDECODE",
     "MOLE_METAL_SINGLE_CB",
     "MOLE_PREWARM",
     "MOLE_PREFETCH",

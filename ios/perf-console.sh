@@ -23,6 +23,12 @@ print(f"共 {len(rows)} 个统计窗口(约每 2 秒一个)")
 for name, idx in (("render 均值 ms", 1), ("单帧峰值 ms", 2), ("每帧通道", 3), ("每帧绘制", 6)):
     vals = [float(r[idx]) for r in rows]
     print(f"  {name:<14} 中位 {st.median(vals):7.2f}  P90 {sorted(vals)[int(len(vals)*0.9)]:7.2f}  最大 {max(vals):7.2f}")
+logic = [re.search(r"\| 逻辑 占用\s*([\d.]+)ms/秒 峰\s*([\d.]+)ms", l) for l in open(sys.argv[1], errors="replace") if "[perf]" in l]
+logic = [m for m in logic if m]
+if logic:
+    for name, idx in (("逻辑 ms/秒", 1), ("逻辑单次峰值 ms", 2)):
+        vals = [float(m[idx]) for m in logic]
+        print(f"  {name:<14} 中位 {st.median(vals):7.2f}  P90 {sorted(vals)[int(len(vals)*0.9)]:7.2f}  最大 {max(vals):7.2f}")
 worst = sorted(rows, key=lambda r: -float(r[3]))[:5]
 print("通道最多的 5 个窗口:")
 for r in worst:

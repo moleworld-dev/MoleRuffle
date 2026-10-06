@@ -122,6 +122,11 @@ struct App {
     perf_render_sum_us: u128,
     perf_render_n: u32,
     perf_render_max_us: u128,
+    /// [perf] 统计窗口内 player.tick()(脚本、时间轴、事件 —— 逻辑帧)的累计 / 最大耗时(微秒),
+    /// 与窗口起点。用来判断游戏内的瓶颈在逻辑还是渲染。
+    perf_tick_sum_us: u128,
+    perf_tick_max_us: u128,
+    perf_tick_window: Instant,
     /// [perf] 上次取样时 wgpu-core 观测计数器的累计值(通道 / 拷贝段 / 绘制),取差值算每帧数量。
     perf_gpu_last: [usize; 4],
     /// [perf] 上次取样时各来源通道数的累计值(下标见 ruffle_render::evict::PassKind)。
@@ -133,6 +138,8 @@ struct App {
     /// [perf] 上次取样时形状细分 + 位图解码统计的累计值(见 ruffle_render::evict::SHAPE_STATS /
     /// BITMAP_DECODE_STATS,后两项是解码)。
     perf_shape_last: [usize; 8],
+    /// [perf] 上次取样时位图预解码统计的累计值(见 ruffle_render::evict::PREDECODE_STATS)。
+    perf_predecode_last: [usize; 8],
     /// iOS [perf] 行的统计窗口起点(按墙钟出行)。
     #[cfg(target_os = "ios")]
     perf_window_start: Instant,
@@ -311,11 +318,15 @@ impl App {
             perf_render_sum_us: 0,
             perf_render_n: 0,
             perf_render_max_us: 0,
+            perf_tick_sum_us: 0,
+            perf_tick_max_us: 0,
+            perf_tick_window: Instant::now(),
             perf_gpu_last: [0; 4],
             perf_kind_last: [0; ruffle_render::evict::PASS_KIND_COUNT],
             perf_dirty_last: [0; 7],
             perf_memo_last: [0; 4],
             perf_shape_last: [0; 8],
+            perf_predecode_last: [0; 8],
             #[cfg(target_os = "ios")]
             perf_window_start: Instant::now(),
             #[cfg(not(target_os = "ios"))]
@@ -630,11 +641,43 @@ impl App {
         if shape[3] > 0 {
             shape_text.push_str(&format!(" ⚠自检不一致{}", shape[3]));
         }
+        // 位图后台预解码:安排 / 直接取到 / 等后台解完 / 主线程收回自解 / 过期 / 超预算,等待耗时。
+        let mut pre = [0usize; 8];
+        for (i, v) in pre.iter_mut().enumerate() {
+            let now = ruffle_render::evict::PREDECODE_STATS[i].load(Relaxed);
+            *v = now.saturating_sub(self.perf_predecode_last[i]);
+            self.perf_predecode_last[i] = now;
+        }
+        if pre.iter().any(|&v| v > 0) {
+            shape_text.push_str(&format!(
+                " 预解 排{}/取{}/等{} {:.1}ms/自解{}/过期{}/超额{}",
+                pre[0],
+                pre[1],
+                pre[2],
+                ms(pre[6]),
+                pre[3],
+                pre[4],
+                pre[5]
+            ));
+            if pre[7] > 0 {
+                shape_text.push_str(&format!(" ⚠预解自检不一致{}", pre[7]));
+            }
+        }
+        // 逻辑帧:每秒耗在 tick 上的毫秒数(=主线程被脚本/时间轴占用的比例 ×1000)与单次最大值。
+        let window_s = self.perf_tick_window.elapsed().as_secs_f64().max(0.001);
+        let logic = format!(
+            "占用{:.1}ms/秒 峰{:.1}ms",
+            self.perf_tick_sum_us as f64 / 1000.0 / window_s,
+            self.perf_tick_max_us as f64 / 1000.0
+        );
+        self.perf_tick_sum_us = 0;
+        self.perf_tick_max_us = 0;
+        self.perf_tick_window = Instant::now();
         self.perf_render_sum_us = 0;
         self.perf_render_n = 0;
         self.perf_render_max_us = 0;
         format!(
-            "render 均{render_ms:>5.2}/峰{render_max_ms:>5.2}ms | 每帧 通道{passes:>5.1}({kinds}) 拷贝段{segments:>5.1} 绘制{draws:>6.1} 快路径{fast_pct:>3.0}% | 脏矩形 {dirty} | 烘焙 {memo} | 形状 {shape_text}"
+            "render 均{render_ms:>5.2}/峰{render_max_ms:>5.2}ms | 每帧 通道{passes:>5.1}({kinds}) 拷贝段{segments:>5.1} 绘制{draws:>6.1} 快路径{fast_pct:>3.0}% | 脏矩形 {dirty} | 烘焙 {memo} | 形状 {shape_text} | 逻辑 {logic}"
         )
     }
 
@@ -1327,12 +1370,16 @@ impl ApplicationHandler<UserEvent> for App {
         let now = Instant::now();
         let dt_ms = now.duration_since(self.last_tick).as_secs_f64() * 1000.0;
         self.last_tick = now;
+        let tick_start = Instant::now();
         let (needs_render, til) = self
             .with_player(|p| {
                 p.tick(FloatDuration::from_millis(dt_ms));
                 (p.needs_render(), p.time_til_next_frame())
             })
             .unwrap_or((false, Duration::from_millis(16)));
+        let tick_us = tick_start.elapsed().as_micros();
+        self.perf_tick_sum_us += tick_us;
+        self.perf_tick_max_us = self.perf_tick_max_us.max(tick_us);
         // 变换插值模式:逻辑仍锁 24fps(tick 内部累加器决定),但每轮都出帧(~60fps),
         // 靠插值 alpha 让显示平滑。非插值模式保持原"仅脏渲染"逻辑。
         #[cfg(not(target_os = "ios"))]
