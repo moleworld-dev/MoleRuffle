@@ -94,6 +94,8 @@ struct App {
     last_pool_trim: Instant,
     /// 上次内存观测/守卫评估的时刻。锁帧后 RedrawRequested 稀疏,故守卫改时间驱动(在 about_to_wait)。
     last_mem_check: Instant,
+    /// 上次打 [内存分类] 的时刻(每 10 秒一行)。
+    last_mem_breakdown: Instant,
     /// 上次同步给引擎的绘制尺寸(物理像素),用于检测 iOS 布局/旋转后的尺寸变化。
     viewport: (u32, u32),
     /// 软键盘请求标志(来自 MoleUiBackend)+ 当前是否已开启,用于按需 set_ime_allowed。
@@ -308,6 +310,7 @@ impl App {
             frames: 0,
             last_pool_trim: Instant::now(),
             last_mem_check: Instant::now(),
+            last_mem_breakdown: Instant::now(),
             viewport: (0, 0),
             kbd: None,
             root_retry: (None, 0),
@@ -488,6 +491,7 @@ impl App {
                 &descriptors.device,
             );
             let descriptors = std::sync::Arc::new(descriptors);
+            let _ = GPU_DEVICE.set(descriptors.device.clone());
             // 后台预建滤镜/离屏表面的渲染管线(ruffle-fork descriptors.rs)。不预建的话它们在登录页
             // 首次出现发光/模糊时在主线程上编译,卡 100~170ms;现在主 SWF 还在下载,正好空闲。
             // vendor/wgpu-hal 补丁的编译期绊线:补丁没被用上时这里编译失败(见 vendor/wgpu-hal/MOLERUFFLE.md)。
@@ -830,6 +834,39 @@ impl App {
     /// ③ `relieve_malloc_pressure` —— ①②只是 `free()`,页仍留在 libmalloc free list 里,**照样计入
     ///    `phys_footprint`(jetsam 的判杀口径)**。不做这一步会出现"回收了几百 MB 但足迹不降"、
     ///    守卫看着没用也真救不回余量。
+    /// [内存分类]:把物理足迹拆成 GPU(Metal 设备总分配)/ CPU 堆(malloc 在用)/ 其余三块,
+    /// 并列出 GPU 里各类缓存、堆里 GC 对象与存活的影片 / 库个数。切场景时哪一类在涨,一看便知。
+    fn log_mem_breakdown(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mb = |bytes: u64| bytes / (1024 * 1024);
+        let ev = &ruffle_render::evict::GPU_GAUGES;
+        let foot = mole::mem::footprint_mb().unwrap_or(0);
+        let gpu = gpu_allocated_mb().unwrap_or(0);
+        let heap = mole::mem::malloc_in_use_mb();
+        let rest = foot as i64 - gpu as i64 - heap as i64;
+        let lib_bitmaps = mb(ruffle_render::evict::RESIDENT_BYTES.load(Relaxed));
+        let lib_count = ruffle_render::evict::RESIDENT_TEXTURES.load(Relaxed);
+        let mesh_count = ruffle_render::evict::MESH_LIVE[0].load(Relaxed);
+        let mesh = mb(ruffle_render::evict::MESH_LIVE[1].load(Relaxed));
+        let cab = mb(ruffle_render::evict::EMPTY_LIVE_BYTES.load(Relaxed));
+        let movies = ruffle_core::tag_utils::LIVE_MOVIES[0].load(Relaxed);
+        let movie_mb = mb(ruffle_core::tag_utils::LIVE_MOVIES[1].load(Relaxed) as u64);
+        let (gc_objects, gc_bytes, libraries) = self
+            .with_player(|p| {
+                let (count, bytes) = p.gc_stats();
+                (count, bytes, p.library_movie_count())
+            })
+            .unwrap_or_default();
+        tracing::info!(
+            "[内存分类] 足迹 {foot}MB = GPU {gpu} + 堆 {heap} + 其余 {rest} | GPU 内:库位图 {lib_bitmaps}({lib_count}张) 缓存位图 {cab} 网格 {mesh}({mesh_count}个) 离屏池闲置 {} 复用池 {} 烘焙 {} 脏矩形 {} | 堆内:GC {}MB({gc_objects}个对象) 影片 {movies}个/{movie_mb}MB 库 {libraries}个",
+            mb(ev[0].load(Relaxed)),
+            mb(ev[1].load(Relaxed)),
+            mb(ev[2].load(Relaxed)),
+            mb(ev[3].load(Relaxed)),
+            mb(gc_bytes as u64),
+        );
+    }
+
     fn reclaim_memory(&mut self, reason: &str) {
         let Some(w) = self.window.clone() else { return };
         let before = mole::mem::footprint_mb().unwrap_or(0);
@@ -1352,6 +1389,10 @@ impl ApplicationHandler<UserEvent> for App {
     // 锁帧驱动:推进 tokio 异步 + 按 SWF 帧率 tick + 仅脏时请求重绘 + 睡到下一帧(渲染在 RedrawRequested 做)
     fn about_to_wait(&mut self, el: &ActiveEventLoop) {
         enter_runtime!(self);
+        if self.last_mem_breakdown.elapsed() >= Duration::from_secs(10) {
+            self.last_mem_breakdown = Instant::now();
+            self.log_mem_breakdown();
+        }
         // 主 SWF 加载失败 → 退避后重新发起(2、4、8 秒,之后每 10 秒),直到成功。
         // 没有它,启动时网络抖一下就永久黑屏;有了它,断网启动后连上网会自己恢复。
         if mole::ROOT_LOAD_FAILED.swap(false, Ordering::Relaxed) {
@@ -1557,6 +1598,24 @@ pub fn run(event_loop: EventLoop<UserEvent>) -> anyhow::Result<()> {
     let mut app = App::new(proxy)?;
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+/// 渲染用的 wgpu 设备(内存分类日志查 GPU 总分配量用)。
+static GPU_DEVICE: std::sync::OnceLock<wgpu::Device> = std::sync::OnceLock::new();
+
+/// Metal 设备当前分配的 GPU 资源总量(MB):纹理、缓冲、驱动内部池,全部算上。
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+fn gpu_allocated_mb() -> Option<u64> {
+    let device = GPU_DEVICE.get()?;
+    // SAFETY: 只读查询设备属性,不创建 / 销毁任何资源。
+    let hal = unsafe { device.as_hal::<wgpu::hal::api::Metal>() }?;
+    let bytes = hal.raw_device().lock().current_allocated_size();
+    Some(bytes / (1024 * 1024))
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+fn gpu_allocated_mb() -> Option<u64> {
+    None
 }
 
 /// iOS:在"文稿/logs"下新建本次运行的日志文件(`moleruffle-<启动时刻秒>.log`),只留最近 5 个。

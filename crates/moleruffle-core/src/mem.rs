@@ -7,12 +7,15 @@
 //! - [`footprint_mb`]:`task_vm_info.phys_footprint`——与 Xcode/Jetsam 完全同口径的内存足迹
 //!   (常驻 + 压缩 + IOKit),即 JetsamEvent 里那个被拿来跟上限比较的 rpages 折算值。
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 mod imp {
     // 三个符号都由 libSystem 导出,声明即用,无需额外链接指令。
+    #[cfg(target_os = "ios")]
     unsafe extern "C" {
         /// 本进程距 per-app 内存上限还剩多少字节(0 = 不可用/不支持)。
         fn os_proc_available_memory() -> usize;
+    }
+    unsafe extern "C" {
         /// 当前 mach task 端口。C 里 `mach_task_self()` 是读这个全局的宏。
         static mach_task_self_: u32;
         fn task_info(task: u32, flavor: u32, info: *mut i32, count: *mut u32) -> i32;
@@ -47,9 +50,16 @@ mod imp {
         phys_footprint: u64,
     }
 
+    #[cfg(target_os = "ios")]
     pub fn available_mb() -> Option<u64> {
         let b = unsafe { os_proc_available_memory() };
         (b != 0).then(|| b as u64 / (1024 * 1024))
+    }
+
+    /// macOS 没有 per-app 内存墙。
+    #[cfg(not(target_os = "ios"))]
+    pub fn available_mb() -> Option<u64> {
+        None
     }
 
     pub fn footprint_mb() -> Option<u64> {
@@ -67,7 +77,7 @@ mod imp {
     }
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
 mod imp {
     pub fn available_mb() -> Option<u64> {
         None
@@ -140,5 +150,32 @@ pub fn relieve_malloc_pressure() -> u64 {
 
 #[cfg(not(any(target_os = "ios", target_os = "macos")))]
 pub fn relieve_malloc_pressure() -> u64 {
+    0
+}
+
+/// 所有 malloc zone 当前在用的字节数(MB)。`malloc_zone_statistics(NULL, …)` 汇总全部 zone,
+/// 是"CPU 堆"这一块的口径(足迹里减掉它和 GPU 分配,剩下的是映射文件、栈、驱动私有内存等)。
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+pub fn malloc_in_use_mb() -> u64 {
+    use std::os::raw::c_void;
+    #[repr(C)]
+    #[derive(Default)]
+    struct MallocStatistics {
+        blocks_in_use: u32,
+        size_in_use: usize,
+        max_size_in_use: usize,
+        size_allocated: usize,
+    }
+    unsafe extern "C" {
+        fn malloc_zone_statistics(zone: *mut c_void, stats: *mut MallocStatistics);
+    }
+    let mut stats = MallocStatistics::default();
+    // SAFETY: NULL zone = 汇总所有 zone;stats 是调用方拥有的输出结构。
+    unsafe { malloc_zone_statistics(core::ptr::null_mut(), &mut stats) };
+    stats.size_in_use as u64 / (1024 * 1024)
+}
+
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
+pub fn malloc_in_use_mb() -> u64 {
     0
 }
