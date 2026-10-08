@@ -140,6 +140,10 @@ struct App {
     perf_shape_last: [usize; 8],
     /// [perf] 上次取样时位图预解码统计的累计值(见 ruffle_render::evict::PREDECODE_STATS)。
     perf_predecode_last: [usize; 8],
+    /// [perf] 上次取样时每帧分段计时的累计值(见 ruffle_render::evict::FRAME_TIMING)。
+    perf_frame_last: [u64; 4],
+    /// [perf] 上次取样时混合层按范围绘制统计的累计值(见 ruffle_render::evict::BLEND_BOUNDS_STATS)。
+    perf_blend_last: [usize; 4],
     /// iOS [perf] 行的统计窗口起点(按墙钟出行)。
     #[cfg(target_os = "ios")]
     perf_window_start: Instant,
@@ -327,6 +331,8 @@ impl App {
             perf_memo_last: [0; 4],
             perf_shape_last: [0; 8],
             perf_predecode_last: [0; 8],
+            perf_frame_last: [0; 4],
+            perf_blend_last: [0; 4],
             #[cfg(target_os = "ios")]
             perf_window_start: Instant::now(),
             #[cfg(not(target_os = "ios"))]
@@ -608,6 +614,24 @@ impl App {
             *m = now.saturating_sub(self.perf_memo_last[i]);
             self.perf_memo_last[i] = now;
         }
+        // 复杂混合层按范围绘制:每帧层数 / 裁到范围内的平均面积占比 / 内容为空跳过的层数。
+        let mut blend = [0usize; 4];
+        for (i, v) in blend.iter_mut().enumerate() {
+            let now = ruffle_render::evict::BLEND_BOUNDS_STATS[i].load(Relaxed);
+            *v = now.saturating_sub(self.perf_blend_last[i]);
+            self.perf_blend_last[i] = now;
+        }
+        let blend_text = if blend[0] == 0 {
+            "无".to_string()
+        } else {
+            format!(
+                "{:.1}层/帧 裁{:.0}% 均面积{:.1}% 空跳{:.1}",
+                blend[0] as f64 / n,
+                blend[1] as f64 * 100.0 / blend[0] as f64,
+                blend[2] as f64 / 10.0 / blend[1].max(1) as f64,
+                blend[3] as f64 / n
+            )
+        };
         let memo = format!(
             "跳{:.1} 拷{:.1} 画{:.1} 存{}",
             memo[0] as f64 / n,
@@ -670,6 +694,20 @@ impl App {
             self.perf_tick_sum_us as f64 / 1000.0 / window_s,
             self.perf_tick_max_us as f64 / 1000.0
         );
+        // 每帧分段(平均 ms):取画布(等系统交出可画的画面,偏大 = GPU 跟不上)/ 录制命令 / 提交+上屏。
+        let mut ft = [0u64; 4];
+        for (i, v) in ft.iter_mut().enumerate() {
+            let now = ruffle_render::evict::FRAME_TIMING[i].load(Relaxed);
+            *v = now.saturating_sub(self.perf_frame_last[i]);
+            self.perf_frame_last[i] = now;
+        }
+        let per = |us: u64| us as f64 / 1000.0 / ft[0].max(1) as f64;
+        let segments_text = format!(
+            "取画布{:.2} 录制{:.2} 提交{:.2}ms",
+            per(ft[1]),
+            per(ft[2]),
+            per(ft[3])
+        );
         self.perf_tick_sum_us = 0;
         self.perf_tick_max_us = 0;
         self.perf_tick_window = Instant::now();
@@ -677,7 +715,7 @@ impl App {
         self.perf_render_n = 0;
         self.perf_render_max_us = 0;
         format!(
-            "render 均{render_ms:>5.2}/峰{render_max_ms:>5.2}ms | 每帧 通道{passes:>5.1}({kinds}) 拷贝段{segments:>5.1} 绘制{draws:>6.1} 快路径{fast_pct:>3.0}% | 脏矩形 {dirty} | 烘焙 {memo} | 形状 {shape_text} | 逻辑 {logic}"
+            "render 均{render_ms:>5.2}/峰{render_max_ms:>5.2}ms | 每帧 通道{passes:>5.1}({kinds}) 拷贝段{segments:>5.1} 绘制{draws:>6.1} 快路径{fast_pct:>3.0}% | 脏矩形 {dirty} | 烘焙 {memo} | 混合层 {blend_text} | 形状 {shape_text} | 逻辑 {logic} | 帧分段 {segments_text}"
         )
     }
 

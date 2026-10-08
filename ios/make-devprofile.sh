@@ -7,10 +7,11 @@
 # 解法:用 ASC API 明确把设备 UDID 塞进开发描述文件,绕开自动签名的抽风。
 #
 # 何时重跑:换调试机、描述文件过期(1年)、或换开发证书时。
-# 用法:ios/make-devprofile.sh [设备UDID]   # 不传则用默认(17PM)
+# 用法:ios/make-devprofile.sh [设备UDID ...]   # 可给多台,全部放进同一个描述文件;不传则用默认两台
+#   (17PM 00008150-…、18PM 00008160-…)。注意:描述文件里只有这里列出的设备,漏掉的那台会装不上。
 set -e
 
-UDID="${1:-00008150-001E10A62132401C}"     # 默认 xcm's iPhone 17 Pro Max
+UDIDS="${*:-00008150-001E10A62132401C 00008160-001A25082EE00036}"   # 默认 xcm's iPhone 17 Pro Max + 18 Pro Max
 BUNDLE="com.moleworld.moleruffle"
 PROFILE_NAME="MoleRuffle Dev CLI"
 # 本机有私钥的 Apple Development 证书 SHA1。自动读取,不写死 —— 证书续签/重发后旧值会让
@@ -23,9 +24,10 @@ KEY="$HOME/.appstoreconnect/private_keys/AuthKey_6N5DAM7RXC.p8"
 KEYID="6N5DAM7RXC"
 ISSUER="0f1cb134-9497-45fb-959c-09fb3a7cf633"
 
-"${PYTHON:-$(command -v python3)}" - "$UDID" "$BUNDLE" "$PROFILE_NAME" "$LOCAL_CERT_SHA1" "$KEY" "$KEYID" "$ISSUER" <<'PYEOF'
+"${PYTHON:-$(command -v python3)}" - "$UDIDS" "$BUNDLE" "$PROFILE_NAME" "$LOCAL_CERT_SHA1" "$KEY" "$KEYID" "$ISSUER" <<'PYEOF'
 import sys, jwt, time, json, urllib.request, urllib.parse, base64, hashlib, os
-UDID,BUNDLE,PROFILE_NAME,CERT_SHA1,KEY_PATH,KEY_ID,ISSUER = sys.argv[1:8]
+UDIDS,BUNDLE,PROFILE_NAME,CERT_SHA1,KEY_PATH,KEY_ID,ISSUER = sys.argv[1:8]
+UDIDS = UDIDS.split()
 tok=jwt.encode({"iss":ISSUER,"iat":int(time.time()),"exp":int(time.time())+900,"aud":"appstoreconnect-v1"},
     open(KEY_PATH).read(),algorithm="ES256",headers={"kid":KEY_ID})
 def req(method,p,payload=None):
@@ -50,13 +52,16 @@ bundle_id=b["data"][0]["id"]
 
 # 3. 设备(未注册则注册)
 _,d=req("GET","/v1/devices?limit=200")
-dev_id=None
-for x in d["data"]:
-    if x["attributes"].get("udid","").replace("-","").upper()==UDID.replace("-","").upper(): dev_id=x["id"]
-if not dev_id:
-    s,r=req("POST","/v1/devices",{"data":{"type":"devices","attributes":{"name":"MoleRuffle Dev Device","platform":"IOS","udid":UDID}}})
-    assert s<400, f"注册设备失败: {r}"
-    dev_id=r["data"]["id"]; print("已注册新设备:", UDID)
+dev_ids=[]
+for UDID in UDIDS:
+    dev_id=None
+    for x in d["data"]:
+        if x["attributes"].get("udid","").replace("-","").upper()==UDID.replace("-","").upper(): dev_id=x["id"]
+    if not dev_id:
+        s,r=req("POST","/v1/devices",{"data":{"type":"devices","attributes":{"name":"MoleRuffle Dev Device","platform":"IOS","udid":UDID}}})
+        assert s<400, f"注册设备失败: {r}"
+        dev_id=r["data"]["id"]; print("已注册新设备:", UDID)
+    dev_ids.append(dev_id)
 
 # 4. 删同名旧 profile
 _,p=req("GET","/v1/profiles?filter[name]="+urllib.parse.quote(PROFILE_NAME)+"&limit=5")
@@ -68,13 +73,13 @@ s,r=req("POST","/v1/profiles",{"data":{"type":"profiles",
     "attributes":{"name":PROFILE_NAME,"profileType":"IOS_APP_DEVELOPMENT"},
     "relationships":{"bundleId":{"data":{"type":"bundleIds","id":bundle_id}},
         "certificates":{"data":[{"type":"certificates","id":cert_id}]},
-        "devices":{"data":[{"type":"devices","id":dev_id}]}}}})
+        "devices":{"data":[{"type":"devices","id":i} for i in dev_ids]}}}})
 assert s<400, f"建 profile 失败: {r}"
 a=r["data"]["attributes"]; uuid=a["uuid"]
 outdir=os.path.expanduser("~/Library/MobileDevice/Provisioning Profiles"); os.makedirs(outdir,exist_ok=True)
 path=os.path.join(outdir,uuid+".mobileprovision")
 open(path,"wb").write(base64.b64decode(a["profileContent"]))
 print(f"✅ 已装开发描述文件 '{PROFILE_NAME}'")
-print(f"   设备 {UDID} | 到期 {a['expirationDate']} | UUID {uuid}")
+print(f"   设备 {' '.join(UDIDS)} | 到期 {a['expirationDate']} | UUID {uuid}")
 PYEOF
-echo "现在可跑: ios/build-device.sh $UDID"
+echo "现在可跑: ios/build-device.sh <devicectl 列出的设备标识>"
