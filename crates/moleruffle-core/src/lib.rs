@@ -105,6 +105,9 @@ pub fn init_process_env() {
         // 实测桌面登录页 render() 6.4ms → 2.7ms(desktop/perf-ab.sh 交替三轮)。只对 Metal 生效,其它后端
         // 走原路径;紧急回退:启动前设 MOLE_METAL_SINGLE_CB=0。开关在第一个渲染通道时读取一次,必须早于首帧。
         set_default("MOLE_METAL_SINGLE_CB", "1");
+        // 记录每个 SWF 加载进哪个应用程序域(排查切场景内存不回落:进了调用方自己的域,脚本类
+        // 会一直引用着场景影片,影片库就不可能随场景释放)。
+        set_default("MOLE_LOG_LOAD_DOMAIN", "1");
         #[cfg(any(target_os = "ios", target_os = "android"))]
         set_default("MOLE_LETTERBOX_FORCED_ALIGN", "1");
         // 位图后台预解码(fork 快路径):解好未取的像素暂存在内存里,手机内存紧,预算减半(桌面 64MB)。
