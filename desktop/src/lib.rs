@@ -144,6 +144,8 @@ struct App {
     perf_frame_last: [u64; 4],
     /// [perf] 上次取样时混合层按范围绘制统计的累计值(见 ruffle_render::evict::BLEND_BOUNDS_STATS)。
     perf_blend_last: [usize; 4],
+    /// [perf] 上次取样时空纹理复用统计的累计值(见 ruffle_render::evict::EMPTY_REUSE_STATS)。
+    perf_empty_last: [usize; 4],
     /// iOS [perf] 行的统计窗口起点(按墙钟出行)。
     #[cfg(target_os = "ios")]
     perf_window_start: Instant,
@@ -333,6 +335,7 @@ impl App {
             perf_predecode_last: [0; 8],
             perf_frame_last: [0; 4],
             perf_blend_last: [0; 4],
+            perf_empty_last: [0; 4],
             #[cfg(target_os = "ios")]
             perf_window_start: Instant::now(),
             #[cfg(not(target_os = "ios"))]
@@ -621,7 +624,7 @@ impl App {
             *v = now.saturating_sub(self.perf_blend_last[i]);
             self.perf_blend_last[i] = now;
         }
-        let blend_text = if blend[0] == 0 {
+        let mut blend_text = if blend[0] == 0 {
             "无".to_string()
         } else {
             format!(
@@ -632,6 +635,16 @@ impl App {
                 blend[3] as f64 / n
             )
         };
+        // 缓存目标空纹理复用(窗口合计):取回 / 新建 / 丢弃。
+        let mut empty = [0usize; 4];
+        for (i, v) in empty.iter_mut().enumerate() {
+            let now = ruffle_render::evict::EMPTY_REUSE_STATS[i].load(Relaxed);
+            *v = now.saturating_sub(self.perf_empty_last[i]);
+            self.perf_empty_last[i] = now;
+        }
+        if empty[0] + empty[1] > 0 {
+            blend_text.push_str(&format!(" | 空纹理 复用{}/新建{}/丢{}", empty[0], empty[1], empty[3]));
+        }
         let memo = format!(
             "跳{:.1} 拷{:.1} 画{:.1} 存{}",
             memo[0] as f64 / n,
