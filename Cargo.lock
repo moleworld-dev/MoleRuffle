@@ -2502,6 +2502,7 @@ dependencies = [
  "futures",
  "jni 0.21.1",
  "log",
+ "metal",
  "moleruffle-core",
  "ndk",
  "ndk-context",

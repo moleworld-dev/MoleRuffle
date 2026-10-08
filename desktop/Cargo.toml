@@ -53,6 +53,11 @@ objc2-ui-kit = { version = "0.2.2", features = [
     "UIGeometry", "UIFontDescriptor",
 ] }
 
+# 苹果平台:内存分类日志里查 Metal 设备的 GPU 总分配量(currentAllocatedSize)。
+# 版本必须与 wgpu-hal 用的 metal 一致(见 Cargo.lock),否则拿到的不是同一个类型。
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
+metal = "0.32"
+
 # 安卓:winit 开 android-game-activity(GameActivity 才有 IME/中文软键盘,登录淘米账号要打字);
 # android-activity 版本须与 winit 内部 pin 的一致(0.6.x),否则双入口链接冲突。
 # 非安卓(桌面/iOS):TLS 用 native-tls(苹果走 Security.framework、Win 走 SChannel,不碰 openssl)。
