@@ -2498,6 +2498,7 @@ dependencies = [
  "anyhow",
  "async-task",
  "cpal",
+ "dirs",
  "futures",
  "jni 0.21.1",
  "log",

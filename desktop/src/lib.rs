@@ -1559,6 +1559,29 @@ pub fn run(event_loop: EventLoop<UserEvent>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// iOS:在"文稿/logs"下新建本次运行的日志文件(`moleruffle-<启动时刻秒>.log`),只留最近 5 个。
+/// 文稿目录开了文件共享,用户也能在"文件"App 里看到。失败就不写文件。
+#[cfg(target_os = "ios")]
+fn ios_log_file() -> Option<std::fs::File> {
+    let dir = dirs::document_dir()?.join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut old: Vec<_> = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "log"))
+        .collect();
+    old.sort();
+    let keep = 4; // 加上这次新建的共 5 个
+    for path in old.iter().take(old.len().saturating_sub(keep)) {
+        let _ = std::fs::remove_file(path);
+    }
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    std::fs::File::create(dir.join(format!("moleruffle-{secs}.log"))).ok()
+}
+
 /// 桌面 / iOS 入口(bin 的 `fn main()` 调它)。安卓不走这里(见 `android_main`)。
 pub fn desktop_main() -> anyhow::Result<()> {
     // ★第一件事★:读开关文件、设各项默认环境变量。必须在任何线程创建之前(见 init_process_env)。
@@ -1572,6 +1595,23 @@ pub fn desktop_main() -> anyhow::Result<()> {
             "warn,winit=error,ruffle=info,avm_trace=info,moleruffle=info",
         )
     });
+    // iOS:日志同时写进 App"文稿/logs"(不插线也能录;玩完插线用 ios/pull-logs.sh 拷回)。
+    #[cfg(target_os = "ios")]
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let file_layer = ios_log_file().map(|file| {
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(file))
+        });
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .with(file_layer)
+            .init();
+    }
+    #[cfg(not(target_os = "ios"))]
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     // 渲染快路径(ruffle-fork 里全部默认关、与上游一致;这里一次性全开),随后 init_from_env
