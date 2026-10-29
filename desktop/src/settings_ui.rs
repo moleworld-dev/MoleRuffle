@@ -38,6 +38,8 @@ pub enum Action {
     Reclaim,
     /// 重启游戏(设置已保存)。
     Restart,
+    /// 虚拟手柄偏好变了(是否总是叠放、不透明度 0.2~1.0),立即重排。
+    Pad { force_overlay: bool, opacity: f64 },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -446,7 +448,12 @@ impl SettingsUi {
                 if spec.key == "MOLE_QUALITY" {
                     self.actions.push(Action::SetQuality(value.clone()));
                 }
+                let pad = matches!(spec.key, "MOLE_PAD_LAYOUT" | "MOLE_PAD_OPACITY");
                 self.values.insert(spec.key.to_string(), value);
+                if pad {
+                    let (force_overlay, opacity) = pad_prefs(&self.values);
+                    self.actions.push(Action::Pad { force_overlay, opacity });
+                }
             }
         }
         match group {
@@ -618,4 +625,22 @@ fn install_cjk_font(ctx: &egui::Context) {
         }
     }
     ctx.set_fonts(fonts);
+}
+
+/// 从设置值算出虚拟手柄偏好:(是否总是叠放, 不透明度 0.2~1.0)。
+pub fn pad_prefs(values: &BTreeMap<String, String>) -> (bool, f64) {
+    let get = |k: &str| {
+        values
+            .get(k)
+            .cloned()
+            .or_else(|| settings::spec(k).map(settings::current))
+            .unwrap_or_default()
+    };
+    let opacity = get("MOLE_PAD_OPACITY").parse::<f64>().unwrap_or(100.0) / 100.0;
+    (get("MOLE_PAD_LAYOUT") == "overlay", opacity.clamp(0.2, 1.0))
+}
+
+/// 启动时的虚拟手柄偏好(读设置文件生效后的环境变量)。
+pub fn boot_pad_prefs() -> (bool, f64) {
+    pad_prefs(&BTreeMap::new())
 }

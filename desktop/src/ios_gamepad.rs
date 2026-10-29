@@ -126,8 +126,12 @@ impl GamePad {
         screen_h: f64,
         scale: f64,
         safe: pad_layout::Insets,
+        force_overlay: bool,
+        opacity: f64,
     ) -> pad_layout::Mode {
-        let l = pad_layout::compute(screen_w, screen_h, safe);
+        let l = pad_layout::compute_with(screen_w, screen_h, safe, force_overlay);
+        // 不透明度只作用于方向键 / 空格面板;切换钮保持清晰,免得找不到。
+        unsafe { self.panel.setAlpha(opacity.clamp(0.2, 1.0)) };
         self.pad_rects.clear();
         for btn in &self.pad_btns {
             let r = match btn.hit {

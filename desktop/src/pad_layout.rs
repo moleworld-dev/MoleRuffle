@@ -113,9 +113,16 @@ pub fn game_rect(w: f64, h: f64) -> Rect {
 
 /// 计算手柄布局。`w`/`h` 为全屏逻辑尺寸,`safe` 为安全区留白。
 pub fn compute(w: f64, h: f64, safe: Insets) -> PadLayout {
+    compute_with(w, h, safe, false)
+}
+
+/// 同 [`compute`];`force_overlay` = 玩家在设置里选了"总是叠在游戏角落"(老布局)。
+pub fn compute_with(w: f64, h: f64, safe: Insets, force_overlay: bool) -> PadLayout {
     let game = game_rect(w, h);
 
-    if w / h < STAGE_ASPECT {
+    if force_overlay {
+        // 直接落到下面的叠放布局。
+    } else if w / h < STAGE_ASPECT {
         // 方屏:底部余量 = 屏幕高 - 游戏高(贴顶后全部在下方),再扣掉底部安全区(横条手势区)。
         let avail = h - game.bottom() - safe.bottom;
         let left0 = safe.left + MARGIN;
@@ -360,6 +367,13 @@ mod tests {
         // 倒 T:↑ 在 ↓ 正上方
         assert_eq!(l.up.x, l.down.x);
         assert!(l.up.bottom() <= l.down.y);
+    }
+
+    #[test]
+    fn 设置为总是叠放时_任何屏幕都用旧布局() {
+        for (w, h, safe) in [ULTRAWIDE, DUO_INNER, IPAD_11] {
+            assert_eq!(compute_with(w, h, safe, true).mode, Mode::Overlay);
+        }
     }
 
     #[test]

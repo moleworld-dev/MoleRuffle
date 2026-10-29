@@ -54,6 +54,8 @@ mod keymap;
 mod pad_layout;
 #[cfg(not(target_os = "android"))]
 mod settings_ui;
+#[cfg(not(any(target_os = "ios", target_os = "android")))]
+mod window_state;
 
 /// winit 自定义事件:把 Ruffle 的异步任务调度回事件循环线程执行。
 enum UserEvent {
@@ -98,6 +100,9 @@ struct App {
     /// 设置浮层需要重新运行一帧(启动、尺寸变化、刚关闭)。
     #[cfg(not(target_os = "android"))]
     settings_ui_dirty: bool,
+    /// 虚拟手柄偏好:(是否总是叠放, 不透明度),见设置项 MOLE_PAD_LAYOUT / MOLE_PAD_OPACITY。
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+    pad_prefs: (bool, f64),
     /// 刚从后台回来(suspended 之后):下一次 tick 只推进一帧(见 `clamp_tick_dt`)。
     resume_pending: bool,
     /// 时间差钳制的累计统计:(被钳次数, 被丢弃的总毫秒),限频打日志用。
@@ -363,6 +368,10 @@ impl App {
             settings_ui: None,
             #[cfg(not(target_os = "android"))]
             settings_ui_dirty: true,
+            #[cfg(not(target_os = "android"))]
+            pad_prefs: settings_ui::boot_pad_prefs(),
+            #[cfg(target_os = "android")]
+            pad_prefs: (false, 1.0),
             resume_pending: false,
             dt_clamped: (0, 0.0),
             last_dt_clamp_log: Instant::now(),
@@ -876,7 +885,8 @@ impl App {
         let (sw, sh) = (w_px as f64 / scale, h_px as f64 / scale);
         let safe = safe_insets(&w);
         if let Some(gp) = self.gamepad.as_mut() {
-            let mode = gp.layout(sw, sh, scale, safe);
+            let (force_overlay, opacity) = self.pad_prefs;
+            let mode = gp.layout(sw, sh, scale, safe, force_overlay, opacity);
             tracing::info!(
                 "叠层重排:{sw:.0}x{sh:.0}pt 安全区 左{:.0}右{:.0}下{:.0} → 手柄{mode:?}",
                 safe.left,
@@ -1067,6 +1077,10 @@ impl App {
                 }
                 settings_ui::Action::Reclaim => self.reclaim_memory("设置界面"),
                 settings_ui::Action::Restart => self.restart_app(),
+                settings_ui::Action::Pad { force_overlay, opacity } => {
+                    self.pad_prefs = (force_overlay, opacity);
+                    self.relayout_overlays();
+                }
             }
         }
         true
@@ -1243,6 +1257,9 @@ impl ApplicationHandler<UserEvent> for App {
         let attrs = Window::default_attributes().with_title(mole::window_title());
         #[cfg(not(target_os = "ios"))]
         let attrs = attrs.with_inner_size(LogicalSize::new(mole::STAGE_WIDTH, mole::STAGE_HEIGHT));
+        // 桌面:上次的窗口大小与位置、最小尺寸、启动全屏(设置项)。
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        let attrs = window_state::apply(attrs, el);
         // ★ iOS 强制横屏:摩尔庄园是 960x560 横屏游戏,但 winit 默认 valid_orientations =
         //   LandscapeAndPortrait,会让 view controller 的 supportedInterfaceOrientations 允许竖屏,
         //   于是 app 停在竖屏、横屏内容被旋转 90° 塞进竖屏窗口。设成 Landscape 让它只报横屏,
@@ -1355,6 +1372,14 @@ impl ApplicationHandler<UserEvent> for App {
     ///
     /// iOS 挑内存大户下手,后台驻留期间足迹越低越不容易被杀;而玩家切回来时本来就要重建画面,
     /// 此刻清池几乎无感(不像游戏中清池会有一帧停顿)。桌面最小化同理,顺带把长期占用降下来。
+    /// 退出(含 Mac 的 ⌘Q,不一定先发 CloseRequested):记下窗口大小与位置。
+    fn exiting(&mut self, _el: &ActiveEventLoop) {
+        #[cfg(not(any(target_os = "ios", target_os = "android")))]
+        if let Some(w) = &self.window {
+            window_state::save(w);
+        }
+    }
+
     fn suspended(&mut self, _el: &ActiveEventLoop) {
         enter_runtime!(self);
         tracing::info!("进入后台,主动回收内存");
@@ -1380,7 +1405,24 @@ impl ApplicationHandler<UserEvent> for App {
             }
         }
         match event {
-            WindowEvent::CloseRequested => el.exit(),
+            WindowEvent::CloseRequested => {
+                #[cfg(not(any(target_os = "ios", target_os = "android")))]
+                if let Some(w) = &self.window {
+                    window_state::save(w);
+                }
+                el.exit()
+            }
+            // 全屏切换:F11(Mac 上也可用系统的 ⌘⌃F / 绿色按钮)。
+            #[cfg(not(any(target_os = "ios", target_os = "android")))]
+            WindowEvent::KeyboardInput { event: ref key, .. }
+                if key.state == ElementState::Pressed
+                    && !key.repeat
+                    && key.logical_key == winit::keyboard::Key::Named(winit::keyboard::NamedKey::F11) =>
+            {
+                if let Some(w) = &self.window {
+                    window_state::toggle_fullscreen(w);
+                }
+            }
             WindowEvent::Resized(_size) => {
                 // 忽略事件携带的 size(iOS 上可能是安全区/全屏不一致),统一用 render_dims(已降采样)。
                 //
