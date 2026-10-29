@@ -360,6 +360,13 @@ pub struct MoleNavigatorInterface;
 
 impl NavigatorInterface for MoleNavigatorInterface {
     fn navigate_to_website(&self, url: Url) {
+        // 2016 联机版:账号相关链接改去本服账号中心(与网页版一致),其余照旧忽略。
+        if let Some(account) = server::selected().account_url
+            && url.host_str() == Some("account.61.com")
+        {
+            open_in_browser(account);
+            return;
+        }
         tracing::info!("navigate_to_website(忽略): {url}");
     }
 
@@ -378,6 +385,22 @@ impl NavigatorInterface for MoleNavigatorInterface {
     ) -> impl std::future::Future<Output = bool> + Send {
         tracing::info!("放行 socket: {host}:{port}");
         async move { true }
+    }
+}
+
+/// 用系统浏览器打开网址(只用于内置的固定网址)。手机端暂时只记日志。
+fn open_in_browser(url: &str) {
+    #[cfg(target_os = "macos")]
+    let cmd = std::process::Command::new("open").arg(url).spawn();
+    #[cfg(target_os = "windows")]
+    let cmd = std::process::Command::new("explorer").arg(url).spawn();
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios", target_os = "android"))))]
+    let cmd = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(any(target_os = "ios", target_os = "android"))]
+    let cmd: std::io::Result<()> = Err(std::io::Error::other("手机端还没接系统浏览器"));
+    match cmd {
+        Ok(_) => tracing::info!("已在浏览器打开 {url}"),
+        Err(e) => tracing::warn!("打不开浏览器({e}),请手动访问 {url}"),
     }
 }
 

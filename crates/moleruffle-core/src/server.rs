@@ -49,6 +49,8 @@ pub struct ServerConfig {
     pub socket_proxy: &'static [ProxyRule],
     /// 覆盖件指纹表 `{请求路径: 内容 sha1 前 8 位}` 的网址(见 [`crate::overlay`])。
     pub overlay_index: Option<&'static str>,
+    /// 游戏里"注册 / 修改密码 / 找回密码"(指向已关停的 account.61.com)改去的账号中心。
+    pub account_url: Option<&'static str>,
     /// 打开 fork 里与 Flash 对齐的 AVM2 修复(`MOLE_AVM_FIXES`)。2016 版客户端需要,
     /// 官方服、平行服的客户端在上游行为下已经验证过,保持不动。
     pub avm_fixes: bool,
@@ -64,6 +66,7 @@ pub const OFFICIAL: ServerConfig = ServerConfig {
     host: "mole.61.com",
     socket_proxy: &[],
     overlay_index: None,
+    account_url: None,
     avm_fixes: false,
 };
 
@@ -77,6 +80,7 @@ pub const PARALLEL: ServerConfig = ServerConfig {
     host: "mole.61player.com",
     socket_proxy: &[],
     overlay_index: None,
+    account_url: None,
     avm_fixes: false,
 };
 
@@ -93,6 +97,7 @@ pub const MOLE2016: ServerConfig = ServerConfig {
     host: "moleworld.net",
     socket_proxy: MOLE2016_PROXY,
     overlay_index: Some("https://moleworld.net/mole2016/mo-ov.json"),
+    account_url: Some("https://moleworld.net/account"),
     avm_fixes: true,
 };
 
