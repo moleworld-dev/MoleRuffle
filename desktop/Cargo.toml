@@ -39,6 +39,10 @@ cpal = "0.16"
 tracing.workspace = true
 tracing-subscriber.workspace = true
 dirs.workspace = true
+# 游戏内高级设置浮层(settings_ui.rs)。版本与 ruffle-fork 桌面版一致(对应 wgpu 27)。
+egui = "0.33.3"
+egui-wgpu = "0.33.3"
+egui-winit = { version = "0.33.3", default-features = false }
 anyhow.workspace = true
 
 # iOS:纯触摸复制粘贴工具条(原生 UIView 叠层)。版本对齐 winit 已用的 objc2 0.5.2 套。

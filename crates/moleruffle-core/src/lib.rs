@@ -30,6 +30,7 @@ pub mod cache;
 pub use cache::{CachingNavigator, PENDING_BIG_LOAD_TRIM, cache_dir};
 pub mod mem;
 pub mod server;
+pub mod settings;
 pub mod workers;
 pub use server::{ServerConfig, base_url as game_base_url, swf_url as game_swf_url};
 
@@ -40,10 +41,12 @@ pub const STAGE_HEIGHT: u32 = 560;
 /// 窗口标题。非官方服会带上服务器名,避免玩家分不清自己连的是哪个服。
 pub fn window_title() -> String {
     let s = server::selected();
+    // 电脑上设置界面的入口是快捷键,标题里提示一下。
+    let hint = if cfg!(target_os = "macos") { "  ·  ⌘, 设置" } else { "  ·  F10 设置" };
     if s.id == server::OFFICIAL.id {
-        "摩尔庄园 · MoleRuffle".to_string()
+        format!("摩尔庄园 · MoleRuffle{hint}")
     } else {
-        format!("摩尔庄园 · MoleRuffle（{}）", s.name)
+        format!("摩尔庄园 · MoleRuffle（{}）{hint}", s.name)
     }
 }
 
@@ -87,6 +90,14 @@ pub fn init_process_env() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         load_flags_file();
+        // 游戏内设置界面保存的设置(settings.txt):作为环境变量默认值,开关文件与手动设的环境变量优先。
+        let applied = settings::apply_at_startup(set_default);
+        if !applied.is_empty() {
+            FLAGS_APPLIED
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!("(设置文件){}", applied.join(" ")));
+        }
         // ★家园/场景灰屏根治(#1010 族,ABC-A1):被加载 SWF(如家园默认背景 160030.swf)主时间轴
         // 第1帧的嵌套多帧 MovieClip(mc2/door_mc)与命名按钮 btn,在 Ruffle 单趟 construct_frame 里
         // 不被构造 → 游戏加载回调访问 goodsMC.mc2.getChildAt(0) / owner.parent["btn"] 拿到 undefined
@@ -488,6 +499,44 @@ impl FontLibrary {
 }
 
 /// 扫描系统字体目录。
+/// 设置界面用的中文字体:按常见中文字体族名依次找,返回(字体文件字节, 集合内序号)。
+/// 只在设置界面第一次打开时调用一次(要扫描系统字体,桌面约几十毫秒)。
+pub fn cjk_font_data() -> Option<(Vec<u8>, u32)> {
+    let db = scan_system_fonts();
+    let families = [
+        "PingFang SC",
+        "Hiragino Sans GB",
+        "Heiti SC",
+        "Microsoft YaHei",
+        "Microsoft YaHei UI",
+        "Noto Sans CJK SC",
+        "Noto Sans SC",
+        "Source Han Sans SC",
+        "WenQuanYi Micro Hei",
+        "Droid Sans Fallback",
+    ];
+    for family in families {
+        let query = fontdb::Query {
+            families: &[fontdb::Family::Name(family)],
+            ..Default::default()
+        };
+        if let Some(id) = db.query(&query)
+            && let Some(found) = db.with_face_data(id, |data, index| (data.to_vec(), index))
+        {
+            tracing::info!("设置界面字体:{family}");
+            return Some(found);
+        }
+    }
+    // 兜底:任何声明支持中文(按名字猜)的字体
+    db.faces()
+        .find(|f| {
+            f.families
+                .iter()
+                .any(|(n, _)| n.contains("CJK") || n.contains("Hei") || n.contains("Song"))
+        })
+        .and_then(|f| db.with_face_data(f.id, |data, index| (data.to_vec(), index)))
+}
+
 fn scan_system_fonts() -> fontdb::Database {
     let started = std::time::Instant::now();
     {

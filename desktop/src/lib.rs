@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 use ruffle_core::backend::navigator::{OwnedFuture, SocketMode};
 use ruffle_core::events::{ImeEvent, MouseButton as RuffleButton, MouseWheelDelta};
 use ruffle_core::{FloatDuration, Player, PlayerBuilder, PlayerEvent};
+use ruffle_render::quality::StageQuality;
 use ruffle_frontend_utils::backends::audio::CpalAudioBackend;
 use ruffle_frontend_utils::backends::navigator::{ExternalNavigatorBackend, FutureSpawner};
 use ruffle_frontend_utils::content::{ContentDescriptor, PlayingContent};
@@ -51,6 +52,8 @@ mod keymap;
 /// 虚拟手柄自适应布局(纯函数;iOS 用,安卓壳按此移植;桌面仅跑单测)。
 #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
 mod pad_layout;
+#[cfg(not(target_os = "android"))]
+mod settings_ui;
 
 /// winit 自定义事件:把 Ruffle 的异步任务调度回事件循环线程执行。
 enum UserEvent {
@@ -89,6 +92,12 @@ struct App {
     mouse_pos: PhysicalPosition<f64>,
     modifiers: Modifiers,
     last_tick: Instant,
+    /// 游戏内高级设置浮层(见 settings_ui.rs)。
+    #[cfg(not(target_os = "android"))]
+    settings_ui: Option<settings_ui::SettingsUi>,
+    /// 设置浮层需要重新运行一帧(启动、尺寸变化、刚关闭)。
+    #[cfg(not(target_os = "android"))]
+    settings_ui_dirty: bool,
     /// 刚从后台回来(suspended 之后):下一次 tick 只推进一帧(见 `clamp_tick_dt`)。
     resume_pending: bool,
     /// 时间差钳制的累计统计:(被钳次数, 被丢弃的总毫秒),限频打日志用。
@@ -236,10 +245,12 @@ fn surface_dims(window: &Window) -> (u32, u32) {
 // 实测纠正:摩尔庄园的显存/发热大头是**离屏渲染目标**(cacheAsBitmap/滤镜/帧缓冲,随 render_scale
 // 面积平方缩放),不是源位图(register_bitmap 实测=0、库里 0 个 Bitmap)。故 render_scale 是同时
 // 管内存与发热的主杠杆。iOS 取 0.8(2294×1056,离屏面积 −36%,明显降热,仍 >2x 源美术 960×560);桌面 1.0。
-#[cfg(target_os = "ios")]
-const RENDER_SCALE: f64 = 0.8;
-#[cfg(not(target_os = "ios"))]
-const RENDER_SCALE: f64 = 1.0;
+// 现在由设置项 MOLE_RENDER_SCALE(百分比,见 moleruffle-core settings.rs)决定,默认 iOS 80、其它 100;
+// 启动时读一次(改了要重启)。
+fn render_scale() -> f64 {
+    static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| mole::settings::render_scale().clamp(0.5, 1.0))
+}
 
 /// 变换插值开关(MOLE_INTERP=1):逻辑仍锁 24fps,但渲染按 ~60fps 出帧,在两个逻辑帧之间
 /// 插值每个显示对象的变换 → 显示更顺却不加速游戏。默认关(正常玩=24fps)。进程级缓存一次。
@@ -295,18 +306,24 @@ fn safe_insets(window: &Window) -> pad_layout::Insets {
     }
 }
 
-/// 喂给 wgpu surface / 引擎 viewport 的渲染尺寸(物理像素 × RENDER_SCALE)。
-/// 注意:**触摸坐标也必须 ×RENDER_SCALE** 才与缩小后的 viewport 一致(见 Touch 处理),
+/// 桌面没有安全区。
+#[cfg(not(target_os = "ios"))]
+fn safe_insets(_window: &Window) -> pad_layout::Insets {
+    pad_layout::Insets::default()
+}
+
+/// 喂给 wgpu surface / 引擎 viewport 的渲染尺寸(物理像素 × render_scale())。
+/// 注意:**触摸坐标也必须 ×render_scale()** 才与缩小后的 viewport 一致(见 Touch 处理),
 /// 否则重蹈"viewport 与触摸坐标空间不一致 → 触摸偏移"的坑。
 /// iOS 文本工具条是叠在**全屏** UIView 上的原生层,其布局/命中仍用未缩放的 `surface_dims`。
 fn render_dims(window: &Window) -> (u32, u32) {
     let (w, h) = surface_dims(window);
-    if RENDER_SCALE == 1.0 {
+    if render_scale() == 1.0 {
         return (w, h);
     }
     (
-        ((w as f64 * RENDER_SCALE).max(1.0)) as u32,
-        ((h as f64 * RENDER_SCALE).max(1.0)) as u32,
+        ((w as f64 * render_scale()).max(1.0)) as u32,
+        ((h as f64 * render_scale()).max(1.0)) as u32,
     )
 }
 
@@ -342,6 +359,10 @@ impl App {
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
             modifiers: Modifiers::default(),
             last_tick: Instant::now(),
+            #[cfg(not(target_os = "android"))]
+            settings_ui: None,
+            #[cfg(not(target_os = "android"))]
+            settings_ui_dirty: true,
             resume_pending: false,
             dt_clamped: (0, 0.0),
             last_dt_clamp_log: Instant::now(),
@@ -392,7 +413,7 @@ impl App {
     }
 
     fn build_player(&self, window: Arc<Window>) -> (Arc<Mutex<Player>>, Arc<AtomicBool>, String) {
-        // 渲染尺寸用 render_dims(iOS 已 ×RENDER_SCALE 降采样,省显存避免 jetsam)
+        // 渲染尺寸用 render_dims(iOS 已 ×render_scale() 降采样,省显存避免 jetsam)
         let (width, height) = render_dims(&window);
 
         // ★启动关键路径并行化★:最先建导航器并立即预取主 SWF(连 DNS 一起),再去建渲染器
@@ -548,8 +569,19 @@ impl App {
                     Some(target.format()),
                 );
             }
-            let backend =
+            let surface_format = {
+                use ruffle_render_wgpu::target::RenderTarget;
+                target.format()
+            };
+            #[cfg_attr(target_os = "android", allow(unused_mut))]
+            let mut backend =
                 WgpuRenderBackend::new(descriptors, target).expect("创建 wgpu 渲染后端失败");
+            // 游戏内设置浮层:每帧上屏前在画面最上面再画一层(见 settings_ui.rs)。
+            #[cfg(not(target_os = "android"))]
+            if let Some(ui) = &self.settings_ui {
+                backend.set_overlay(Some(ui.overlay(surface_format)));
+            }
+            let _ = surface_format;
             (backend, render_api)
         };
 
@@ -1001,6 +1033,60 @@ impl App {
         });
     }
 
+    /// 运行一帧设置浮层并执行它发出的动作。返回本轮是否需要出帧。
+    #[cfg(not(target_os = "android"))]
+    fn settings_ui_frame(&mut self) -> bool {
+        let Some(window) = self.window.clone() else {
+            return false;
+        };
+        let Some(ui) = self.settings_ui.as_mut() else {
+            return false;
+        };
+        let active = ui.wants_redraw();
+        if !active && !self.settings_ui_dirty {
+            return false;
+        }
+        self.settings_ui_dirty = false;
+        let safe = safe_insets(&window);
+        ui.run(&window, render_scale(), (safe.left, safe.top, safe.right, safe.bottom));
+        if !ui.open && active {
+            // 刚关闭:再运行一帧(只剩齿轮)把面板擦掉。
+            self.settings_ui_dirty = true;
+        }
+        for action in ui.take_actions() {
+            match action {
+                settings_ui::Action::SetQuality(q) => {
+                    let quality = match q.as_str() {
+                        "low" => StageQuality::Low,
+                        "medium" => StageQuality::Medium,
+                        "high" => StageQuality::High,
+                        _ => StageQuality::High8x8,
+                    };
+                    self.with_player(|p| p.set_quality(quality));
+                    tracing::info!("设置:画质切到 {q}");
+                }
+                settings_ui::Action::Reclaim => self.reclaim_memory("设置界面"),
+                settings_ui::Action::Restart => self.restart_app(),
+            }
+        }
+        true
+    }
+
+    /// 重启游戏(设置已保存)。先释放播放器(Player 释放时把存档写盘),桌面再拉起一个新进程;
+    /// iOS 不允许应用自己重新打开,退出后由玩家点图标重开(设置已保存,重开即生效)。
+    #[cfg(not(target_os = "android"))]
+    fn restart_app(&mut self) {
+        tracing::info!("设置:保存并重启游戏");
+        self.player = None;
+        #[cfg(not(target_os = "ios"))]
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe)
+                .args(std::env::args_os().skip(1))
+                .spawn();
+        }
+        std::process::exit(0);
+    }
+
     fn reclaim_memory(&mut self, reason: &str) {
         let Some(w) = self.window.clone() else { return };
         let before = mole::mem::footprint_mb().unwrap_or(0);
@@ -1178,6 +1264,10 @@ impl ApplicationHandler<UserEvent> for App {
             sz.height,
             window.scale_factor()
         );
+        #[cfg(not(target_os = "android"))]
+        {
+            self.settings_ui = Some(settings_ui::SettingsUi::new(&window));
+        }
         let (player, kbd, render_api) = self.build_player(window.clone());
         self.render_api = render_api;
         window.request_redraw();
@@ -1275,6 +1365,20 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn window_event(&mut self, el: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         enter_runtime!(self);
+        // 设置浮层先看:被它吃掉的输入不再交给游戏。
+        #[cfg(not(target_os = "android"))]
+        if let (Some(ui), Some(w)) = (self.settings_ui.as_mut(), self.window.clone()) {
+            if matches!(event, WindowEvent::Resized(_) | WindowEvent::ScaleFactorChanged { .. }) {
+                self.settings_ui_dirty = true;
+            }
+            let was_open = ui.open;
+            if ui.on_window_event(&w, &event) {
+                if was_open && !ui.open {
+                    self.settings_ui_dirty = true;
+                }
+                return;
+            }
+        }
         match event {
             WindowEvent::CloseRequested => el.exit(),
             WindowEvent::Resized(_size) => {
@@ -1320,8 +1424,8 @@ impl ApplicationHandler<UserEvent> for App {
                 self.mouse_pos = position;
                 self.with_player(|p| {
                     p.handle_event(PlayerEvent::MouseMove {
-                        x: position.x * RENDER_SCALE,
-                        y: position.y * RENDER_SCALE,
+                        x: position.x * render_scale(),
+                        y: position.y * render_scale(),
                     })
                 });
             }
@@ -1408,9 +1512,9 @@ impl ApplicationHandler<UserEvent> for App {
                         return;
                     }
                 }
-                // 游戏用缩放后的坐标:viewport 已 ×RENDER_SCALE,触摸(全屏物理像素)也必须同比缩,
+                // 游戏用缩放后的坐标:viewport 已 ×render_scale(),触摸(全屏物理像素)也必须同比缩,
                 // 否则触摸空间(全屏)≠ viewport(缩小)→ 又触摸偏移。工具条命中已在上面用全屏坐标判过。
-                let (x, y) = (x * RENDER_SCALE, y * RENDER_SCALE);
+                let (x, y) = (x * render_scale(), y * render_scale());
                 self.with_player(|p| match phase {
                     TouchPhase::Started => {
                         p.handle_event(PlayerEvent::MouseMove { x, y });
@@ -1458,8 +1562,8 @@ impl ApplicationHandler<UserEvent> for App {
                     _ => RuffleButton::Unknown,
                 };
                 let (x, y) = (
-                    self.mouse_pos.x * RENDER_SCALE,
-                    self.mouse_pos.y * RENDER_SCALE,
+                    self.mouse_pos.x * render_scale(),
+                    self.mouse_pos.y * render_scale(),
                 );
                 #[cfg(not(target_os = "ios"))]
                 if state == ElementState::Pressed {
@@ -1643,6 +1747,9 @@ impl ApplicationHandler<UserEvent> for App {
         let tick_us = tick_start.elapsed().as_micros();
         self.perf_tick_sum_us += tick_us;
         self.perf_tick_max_us = self.perf_tick_max_us.max(tick_us);
+        // 设置浮层:打开时每轮运行界面并强制出帧;关闭后再画一帧把它擦掉。
+        #[cfg(not(target_os = "android"))]
+        let needs_render = needs_render || self.settings_ui_frame();
         // 变换插值模式:逻辑仍锁 24fps(tick 内部累加器决定),但每轮都出帧(~60fps),
         // 靠插值 alpha 让显示平滑。非插值模式保持原"仅脏渲染"逻辑。
         #[cfg(not(target_os = "ios"))]
