@@ -89,6 +89,13 @@ struct App {
     mouse_pos: PhysicalPosition<f64>,
     modifiers: Modifiers,
     last_tick: Instant,
+    /// 刚从后台回来(suspended 之后):下一次 tick 只推进一帧(见 `clamp_tick_dt`)。
+    resume_pending: bool,
+    /// 时间差钳制的累计统计:(被钳次数, 被丢弃的总毫秒),限频打日志用。
+    dt_clamped: (u32, f64),
+    last_dt_clamp_log: Instant,
+    /// 当前按住的键盘键(失焦时统一补发抬起,防卡键)。
+    keys_held: std::collections::HashSet<ruffle_core::events::KeyDescriptor>,
     frames: u64,
     /// 上次主动重置纹理池的时刻,限频用(避免反复重建 surface 卡顿)。
     last_pool_trim: Instant,
@@ -307,6 +314,10 @@ impl App {
             mouse_pos: PhysicalPosition::new(0.0, 0.0),
             modifiers: Modifiers::default(),
             last_tick: Instant::now(),
+            resume_pending: false,
+            dt_clamped: (0, 0.0),
+            last_dt_clamp_log: Instant::now(),
+            keys_held: std::collections::HashSet::new(),
             frames: 0,
             last_pool_trim: Instant::now(),
             last_mem_check: Instant::now(),
@@ -867,6 +878,64 @@ impl App {
         );
     }
 
+    /// 钳制交给引擎的时间差。原样交会出问题:从后台回来、休眠唤醒、Windows 拖窗口卡住
+    /// 事件循环之后,第一帧的时间差就是整段停顿,引擎会一口气补跑最多 5 帧、定时器连发
+    /// 最多 10 次,游戏发出的包时间戳跳变,服务器可能因此踢线(参考 mole-flash-android 1.1.0
+    /// 的根因分析)。规则同对方:刚从后台回来或超过 800ms 只推进一帧;250~800ms 截到 250ms;
+    /// 平时与真实时间 1:1。`MOLE_DT_CLAMP=0` 关闭(对照用)。
+    fn clamp_tick_dt(&mut self, raw_ms: f64) -> f64 {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*ENABLED.get_or_init(|| std::env::var("MOLE_DT_CLAMP").as_deref() != Ok("0")) {
+            return raw_ms;
+        }
+        let frame_ms = self
+            .with_player(|p| 1000.0 / p.frame_rate().max(1.0))
+            .unwrap_or(1000.0 / 24.0);
+        let resumed = std::mem::take(&mut self.resume_pending);
+        let dt = if resumed || raw_ms > 800.0 {
+            raw_ms.min(frame_ms)
+        } else {
+            raw_ms.min(250.0)
+        };
+        if dt < raw_ms {
+            self.dt_clamped.0 += 1;
+            self.dt_clamped.1 += raw_ms - dt;
+            if resumed || self.last_dt_clamp_log.elapsed() >= Duration::from_secs(8) {
+                tracing::info!(
+                    "时间差钳制:{raw_ms:.0}ms → {dt:.0}ms{}(累计 {} 次、丢弃 {:.1} 秒)",
+                    if resumed { "(刚从后台回来)" } else { "" },
+                    self.dt_clamped.0,
+                    self.dt_clamped.1 / 1000.0
+                );
+                self.last_dt_clamp_log = Instant::now();
+            }
+        }
+        dt
+    }
+
+    /// 补发抬起所有按住的输入(键盘键、iOS 虚拟手柄键),用于失焦和进后台:
+    /// 抬起事件此时会被别处收走,不补发就会卡键(人物一直走)。
+    fn release_all_inputs(&mut self, reason: &str) {
+        #[cfg_attr(not(target_os = "ios"), allow(unused_mut))]
+        let mut keys: Vec<_> = self.keys_held.drain().collect();
+        #[cfg(target_os = "ios")]
+        keys.extend(
+            self.gamepad_touches
+                .drain()
+                .map(|(_, k)| keymap::gamepad_key_descriptor(k)),
+        );
+        if keys.is_empty() {
+            return;
+        }
+        let n = keys.len();
+        self.with_player(|p| {
+            for key in keys {
+                p.handle_event(PlayerEvent::KeyUp { key });
+            }
+        });
+        tracing::info!("{reason}:补发 {n} 个按键抬起(防卡键)");
+    }
+
     fn reclaim_memory(&mut self, reason: &str) {
         let Some(w) = self.window.clone() else { return };
         let before = mole::mem::footprint_mb().unwrap_or(0);
@@ -1134,6 +1203,8 @@ impl ApplicationHandler<UserEvent> for App {
     fn suspended(&mut self, _el: &ActiveEventLoop) {
         enter_runtime!(self);
         tracing::info!("进入后台,主动回收内存");
+        self.resume_pending = true;
+        self.release_all_inputs("进后台");
         self.reclaim_memory("进后台");
     }
 
@@ -1280,7 +1351,20 @@ impl ApplicationHandler<UserEvent> for App {
                     TouchPhase::Moved => {
                         p.handle_event(PlayerEvent::MouseMove { x, y });
                     }
-                    TouchPhase::Ended | TouchPhase::Cancelled => {
+                    TouchPhase::Cancelled => {
+                        // 系统手势(控制中心、来电横幅、上滑回桌面)抢走了这次触摸:不能当成正常抬起,
+                        // 否则会在落点补一次点击、误点按钮。把指针移到舞台外再松开,Flash 收到的是
+                        // releaseOutside,这次点击作废;左键也不会一直处于按下状态。
+                        let (ox, oy) = (-10_000.0, -10_000.0);
+                        p.handle_event(PlayerEvent::MouseMove { x: ox, y: oy });
+                        p.handle_event(PlayerEvent::MouseUp {
+                            x: ox,
+                            y: oy,
+                            button: RuffleButton::Left,
+                        });
+                        p.handle_event(PlayerEvent::MouseLeave);
+                    }
+                    TouchPhase::Ended => {
                         // 先把指针对齐到抬手落点,再松开,保证点击命中正确控件
                         p.handle_event(PlayerEvent::MouseMove { x, y });
                         p.handle_event(PlayerEvent::MouseUp {
@@ -1340,6 +1424,14 @@ impl ApplicationHandler<UserEvent> for App {
                 if event.state == ElementState::Pressed {
                     self.pending_input = Some(Instant::now());
                 }
+                match event.state {
+                    ElementState::Pressed => {
+                        self.keys_held.insert(key);
+                    }
+                    ElementState::Released => {
+                        self.keys_held.remove(&key);
+                    }
+                }
                 self.with_player(|p| match event.state {
                     ElementState::Pressed => {
                         p.handle_event(PlayerEvent::KeyDown { key });
@@ -1358,6 +1450,11 @@ impl ApplicationHandler<UserEvent> for App {
                         p.handle_event(PlayerEvent::KeyUp { key });
                     }
                 });
+            }
+            // 失焦(Alt+Tab / Cmd+Tab 切走):抬键事件会被别的窗口收走,这里统一补发抬起,
+            // 否则切回来人物一直走(卡键)。
+            WindowEvent::Focused(false) => {
+                self.release_all_inputs("失焦");
             }
             WindowEvent::Ime(ime) => {
                 // 输入法(中文等):预编辑 + 提交
@@ -1460,8 +1557,9 @@ impl ApplicationHandler<UserEvent> for App {
         // 帧率锁定 + 脏标记:按 SWF 帧率 tick,只在内容真变化(needs_render)时请求重绘,然后睡到下一帧。
         // 摩尔庄园 ~24-30fps,屏幕 60Hz 时这砍掉约一半 GPU/发热;挂机/对话框近乎 0 重绘。
         let now = Instant::now();
-        let dt_ms = now.duration_since(self.last_tick).as_secs_f64() * 1000.0;
+        let raw_dt_ms = now.duration_since(self.last_tick).as_secs_f64() * 1000.0;
         self.last_tick = now;
+        let dt_ms = self.clamp_tick_dt(raw_dt_ms);
         let tick_start = Instant::now();
         let (needs_render, til) = self
             .with_player(|p| {
