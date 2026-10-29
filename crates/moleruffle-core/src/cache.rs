@@ -339,6 +339,20 @@ fn text_looks_complete(url: &str, bytes: &[u8], expected: Option<u64>) -> bool {
     true
 }
 
+/// 二进制资源(SWF、图片、音频、字体等)看起来是完整的正常文件:非空;已知长度时长度一致;
+/// 内容不像网页(去掉开头空白后不以 `<` 开头)。挡住公共 Wi-Fi 认证页 / 运营商劫持返回的 200
+/// 网页、空响应和截断的正文 —— 二进制资源不复核也不过期,一旦写进缓存,对应场景会永久打不开
+/// (参考项目 mole-flash-android 1.0.2 也踩过"空响应被钉死"的坑;官方服确有 200 + 0 字节的
+/// 资源,如 resource/login/2021ment.swf)。
+/// ★不按扩展名检查文件头:游戏自己加密的资源(如 version/version*.swf 开头是自定义 8 字节,
+/// 后面才是 zlib 数据,由脚本解密)文件头不标准,按 FWS/CWS 卡会误杀。
+fn binary_looks_valid(bytes: &[u8], expected: Option<u64>) -> bool {
+    if bytes.is_empty() || expected.is_some_and(|n| n != bytes.len() as u64) {
+        return false;
+    }
+    bytes.iter().find(|b| !b.is_ascii_whitespace()) != Some(&b'<')
+}
+
 /// 本进程里已经后台复核过的带版本文本(每个网址每次启动只复核一次)。
 static REVALIDATED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
@@ -581,8 +595,16 @@ impl<N: NavigatorBackend> CachingNavigator<N> {
             // ① 缓存命中:读盘 +(SWF)解压都在后台线程完成,主线程只拿到可直接解析的字节。
             let path_for_revalidate = cache_path.clone();
             if let Some(path) = cache_path.clone() {
+                let check_url = resp_url.clone();
+                let is_text_hit = abs.as_ref().is_some_and(is_versioned_text);
                 let hit = workers::offload(move || {
                     let raw = std::fs::read(&path).ok()?;
+                    // 以前没有写入校验,旧缓存里可能已经有空文件 / 网页:删掉,当未命中重下。
+                    if !is_text_hit && !binary_looks_valid(&raw, None) {
+                        tracing::warn!("缓存文件损坏(空文件或网页),删除重下: {check_url}");
+                        let _ = std::fs::remove_file(&path);
+                        return None;
+                    }
                     let disk_len = raw.len();
                     Some((disk_len, if is_swf { cws_to_fws(raw) } else { raw }))
                 })
@@ -810,11 +832,23 @@ impl<N: NavigatorBackend> CachingNavigator<N> {
                 } => {
                     // 文本文件:响应头带了字符集,或内容不像完整的正常文件(错误页、截断),就不写缓存。
                     let is_text = abs.as_ref().is_some_and(is_versioned_text);
-                    let cache_path = cache_path.filter(|_| {
-                        !is_text
-                            || (encoding.is_none()
-                                && text_looks_complete(&final_url, &bytes, expected))
+                    // 被重定向到别的主机(认证页、劫持)的响应不缓存。
+                    let same_host = abs.as_ref().is_some_and(|u| {
+                        Url::parse(&final_url).ok().and_then(|f| f.host_str().map(str::to_owned))
+                            == u.host_str().map(str::to_owned)
                     });
+                    let cache_path = cache_path.filter(|_| {
+                        same_host
+                            && if is_text {
+                                encoding.is_none()
+                                    && text_looks_complete(&final_url, &bytes, expected)
+                            } else {
+                                binary_looks_valid(&bytes, expected)
+                            }
+                    });
+                    if cache_path.is_none() && !is_text && !same_host {
+                        tracing::warn!("资源被重定向到别的主机,不写缓存: {url} → {final_url}");
+                    }
                     let Some(path) = cache_path else {
                         // root SWF / 不缓存的文本:body 已读完,原样(连同字符集)交给引擎。
                         let mut resp = CachedResponse::new(final_url, bytes);
@@ -1020,8 +1054,23 @@ pub fn trim_cache_in_background() {
 
 #[cfg(test)]
 mod tests {
-    use super::{cws_to_fws, is_home_loaded_ping};
+    use super::{binary_looks_valid, cws_to_fws, is_home_loaded_ping};
     use std::io::Write;
+
+    #[test]
+    fn binary_validation() {
+        let ok = |b: &[u8]| binary_looks_valid(b, None);
+        assert!(ok(b"CWS\x0aabc"));
+        // 游戏自己加密的 SWF:文件头不标准也要放行
+        assert!(ok(b"\x01\x33\x53\x05\x56\x8c\xea\x10\x78\xda"));
+        assert!(ok(b"\x89PNG\r\n\x1a\nxx"));
+        assert!(!ok(b""));
+        assert!(!ok(b"<html>login</html>"));
+        assert!(!ok(b"  \r\n<!DOCTYPE html>"));
+        // 长度对不上(截断)
+        assert!(!binary_looks_valid(b"CWSabc", Some(100)));
+        assert!(binary_looks_valid(b"CWSabc", Some(6)));
+    }
 
     #[test]
     fn home_loaded_ping() {
