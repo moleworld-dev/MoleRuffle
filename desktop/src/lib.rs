@@ -464,6 +464,7 @@ impl App {
         // ★ 本地资源缓存(CDN 思路):静态资源 SWF/图片缓存到磁盘,二次加载秒开且免网络,
         //   缓解 mole.61.com 慢/抖动导致的"维护"与每次重下。socket/登录动态请求不走缓存。
         let navigator = mole::CachingNavigator::new(navigator, mole::cache_dir());
+        navigator.load_overlay_index();
 
         if std::env::var("MOLE_PREFETCH").as_deref() != Ok("0") {
             navigator.prefetch(mole::server::selected().swf_url);

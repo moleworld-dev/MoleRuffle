@@ -29,9 +29,11 @@ use url::Url;
 pub mod cache;
 pub use cache::{CachingNavigator, PENDING_BIG_LOAD_TRIM, cache_dir};
 pub mod mem;
+pub mod overlay;
 pub mod server;
 pub mod settings;
 pub mod workers;
+pub mod ws_proxy;
 pub use server::{ServerConfig, base_url as game_base_url, swf_url as game_swf_url};
 
 /// 固定舞台尺寸(Client.swf 的逻辑尺寸)。
@@ -106,6 +108,10 @@ pub fn init_process_env() {
         // 删改重排(loader.rs:2101-2104),且只对调用本函数的摩尔庄园路径生效(摩尔勇士 hero.61.com
         // 不调此函数,拿逐字节上游行为,隔离成立)。live 读 env,启动期设置立即生效。
         set_default("MOLE_LOADER_EAGER_CONSTRUCT", "1");
+        // 2016 联机版的客户端需要 fork 里与 Flash 对齐的三处 AVM2 修复(见 server.rs);引擎只读一次。
+        if server::selected().avm_fixes {
+            set_default("MOLE_AVM_FIXES", "1");
+        }
         // 影片背景色生效前用黑色清屏(fork 默认白色):iOS 启动屏是黑的,等 Client.swf 那几秒
         // 整屏闪白很刺眼。影片自己的背景色一旦生效照常使用。见 ruffle-fork player.rs。
         set_default("MOLE_DEFAULT_BG_BLACK", "1");

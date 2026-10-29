@@ -27,6 +27,8 @@ use std::sync::OnceLock;
 
 use url::Url;
 
+use crate::ws_proxy::ProxyRule;
+
 /// 一个可连的摩尔庄园服务器。五个字段同源同变,不可拆开使用。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerConfig {
@@ -43,6 +45,13 @@ pub struct ServerConfig {
     pub spoof_url: &'static str,
     /// 主机名。缓存白名单按它**精确匹配** `Url::host_str()`(不是子串匹配)。
     pub host: &'static str,
+    /// 游戏连这些地址时改走 WebSocket 中转(见 [`crate::ws_proxy`])。空 = 直连 TCP。
+    pub socket_proxy: &'static [ProxyRule],
+    /// 覆盖件指纹表 `{请求路径: 内容 sha1 前 8 位}` 的网址(见 [`crate::overlay`])。
+    pub overlay_index: Option<&'static str>,
+    /// 打开 fork 里与 Flash 对齐的 AVM2 修复(`MOLE_AVM_FIXES`)。2016 版客户端需要,
+    /// 官方服、平行服的客户端在上游行为下已经验证过,保持不动。
+    pub avm_fixes: bool,
 }
 
 /// 官方服(淘米官方,`Client.swf` 自 2022-12 起未再更新)。
@@ -53,6 +62,9 @@ pub const OFFICIAL: ServerConfig = ServerConfig {
     base_url: "http://mole.61.com/",
     spoof_url: "http://mole.61.com/Client.swf",
     host: "mole.61.com",
+    socket_proxy: &[],
+    overlay_index: None,
+    avm_fixes: false,
 };
 
 /// 平行摩尔(饭制服,与官方站同构;实测仍在活跃迭代,`Cache-Control: no-cache`)。
@@ -63,10 +75,50 @@ pub const PARALLEL: ServerConfig = ServerConfig {
     base_url: "https://mole.61player.com/",
     spoof_url: "https://mole.61player.com/Client.swf",
     host: "mole.61player.com",
+    socket_proxy: &[],
+    overlay_index: None,
+    avm_fixes: false,
 };
 
+/// 2016 联机版(摩尔庄园 1 网页版那套服,moleworld.net/mole2016/)。
+///
+/// 服务端下发的登录、游戏、小游戏地址都是内网地址,对外只开 WebSocket(websockify),
+/// 规则表与网页版 `SOCKET_PROXY` 逐条一致(MoleRosetta/deploy/browser/index.html)。
+pub const MOLE2016: ServerConfig = ServerConfig {
+    id: "mole2016",
+    name: "2016 联机版",
+    swf_url: "https://moleworld.net/mole2016/Client.swf",
+    base_url: "https://moleworld.net/mole2016/",
+    spoof_url: "https://moleworld.net/mole2016/Client.swf",
+    host: "moleworld.net",
+    socket_proxy: MOLE2016_PROXY,
+    overlay_index: Some("https://moleworld.net/mole2016/mo-ov.json"),
+    avm_fixes: true,
+};
+
+const MOLE2016_LOGIN: &str = "wss://moleworld.net/mole2016-login-ws";
+const MOLE2016_GAME: &str = "wss://moleworld.net/mole2016-game-ws";
+const MOLE2016_GAMESVR: &str = "wss://moleworld.net/mole2016-gamesvr-ws";
+
+const fn rule(host: &'static str, port: u16, url: &'static str, connect_on_open: bool) -> ProxyRule {
+    ProxyRule { host, port, url, connect_on_open }
+}
+
+/// 登录服条目握手完才报已连接,游戏服、小游戏服立刻报(原因见 [`crate::ws_proxy`])。
+/// 末尾两条是客户端登录超时后改连的两个淘米老地址,它们是登录服的备用地址,要接到登录服。
+const MOLE2016_PROXY: &[ProxyRule] = &[
+    rule("127.0.0.1", 7788, MOLE2016_LOGIN, true),
+    rule("192.168.215.2", 7788, MOLE2016_LOGIN, true),
+    rule("127.0.0.1", 1863, MOLE2016_GAME, false),
+    rule("192.168.215.2", 1863, MOLE2016_GAME, false),
+    rule("127.0.0.1", 3001, MOLE2016_GAMESVR, false),
+    rule("192.168.215.2", 3001, MOLE2016_GAMESVR, false),
+    rule("123.150.163.99", 1863, MOLE2016_LOGIN, true),
+    rule("125.39.236.145", 1863, MOLE2016_LOGIN, true),
+];
+
 /// 所有内置服务器(选服 UI 遍历用)。
-pub const ALL: &[ServerConfig] = &[OFFICIAL, PARALLEL];
+pub const ALL: &[ServerConfig] = &[OFFICIAL, PARALLEL, MOLE2016];
 
 /// 按 id 找服务器。
 pub fn by_id(id: &str) -> Option<ServerConfig> {

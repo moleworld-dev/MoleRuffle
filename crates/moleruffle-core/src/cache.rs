@@ -161,6 +161,30 @@ impl<N> CachingNavigator<N> {
         self.prefetch_with(url, true);
     }
 
+    /// 有覆盖件指纹表的服务器(2016 联机版):后台取一次指纹表,见 [`crate::overlay`]。
+    /// 取不到就一直不缓存本服的资源(每次照常下载),不会拿到旧覆盖件。
+    pub fn load_overlay_index(&self)
+    where
+        N: NavigatorBackend,
+    {
+        let Some(url) = server::selected().overlay_index else {
+            return;
+        };
+        let fut = self.inner.borrow().fetch(Request::get(url.to_string()));
+        self.inner.borrow_mut().spawn_future(Box::pin(async move {
+            let result = match fut.await {
+                Ok(resp) if resp.status() == 200 => resp.body().await.map_err(|e| e.to_string()),
+                Ok(resp) => Err(format!("HTTP {}", resp.status())),
+                Err(e) => Err(e.error.to_string()),
+            };
+            match result.and_then(|body| crate::overlay::install(&body)) {
+                Ok(n) => tracing::info!("覆盖件指纹表 {n} 条"),
+                Err(e) => tracing::warn!("覆盖件指纹表取不到({e}),本服资源这次不缓存"),
+            }
+            Ok(())
+        }));
+    }
+
     fn prefetch_with(&self, url: &str, ignore_query: bool)
     where
         N: NavigatorBackend,
@@ -240,6 +264,10 @@ fn is_cacheable(abs: &Url, has_body: bool) -> bool {
         return false;
     }
     if abs.host_str() != Some(server::selected().host) {
+        return false;
+    }
+    // 覆盖件指纹表还没到:分不出哪些网址是覆盖件,先都不缓存(见 overlay.rs)。
+    if crate::overlay::pending() {
         return false;
     }
     let path = abs.path().to_ascii_lowercase();
@@ -436,6 +464,12 @@ fn is_home_loaded_ping(url: &str) -> bool {
 
 impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
     fn fetch(&self, request: Request) -> OwnedFuture<Box<dyn SuccessResponse>, ErrorResponse> {
+        let mut request = request;
+        if let Ok(abs) = self.inner.borrow().resolve_url(request.url())
+            && let Some(url) = crate::overlay::rewrite(&abs)
+        {
+            request.set_url(url);
+        }
         // 发出请求时就记(不等统计服务器响应):桌面对照脚本 perf-ab / startup-ab 拿它当"登录页就绪"。
         if is_home_loaded_ping(request.url()) {
             tracing::info!("里程碑:游戏报告首页素材加载成功");
@@ -513,6 +547,11 @@ impl<N: NavigatorBackend> NavigatorBackend for CachingNavigator<N> {
         receiver: Receiver<Vec<u8>>,
         sender: Sender<SocketAction>,
     ) {
+        if let Some(rule) = crate::ws_proxy::find(server::selected().socket_proxy, &host, port) {
+            tracing::info!("socket {host}:{port} 改走中转 {}", rule.url);
+            crate::ws_proxy::spawn(rule, timeout, handle, receiver, sender);
+            return;
+        }
         self.inner
             .borrow_mut()
             .connect_socket(host, port, timeout, handle, receiver, sender)

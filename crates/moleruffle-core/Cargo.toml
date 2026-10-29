@@ -27,6 +27,21 @@ async-io = "2"
 # 缓存层在后台线程把 CWS(zlib 压缩)SWF 解成 FWS 再交给引擎,主线程不再解压。
 # 只开 zlib-rs 后端(依赖图里已经在用,不再额外拉 miniz_oxide);版本与 ruffle 对齐。
 flate2 = { version = "1.1.9", default-features = false, features = ["zlib-rs"] }
+# 2016 联机版的覆盖件指纹表(mo-ov.json)。依赖图里已有。
+serde_json = "1"
+# 2016 联机版的 Socket → WebSocket 中转(ws_proxy.rs)。TLS 后端与 HTTPS 一致:
+# 非安卓走系统 TLS(native-tls),安卓走 rustls。
+tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+
+[target.'cfg(not(target_os = "android"))'.dependencies.tungstenite]
+version = "0.28"
+default-features = false
+features = ["handshake", "native-tls"]
+
+[target.'cfg(target_os = "android")'.dependencies.tungstenite]
+version = "0.28"
+default-features = false
+features = ["handshake", "rustls-tls-native-roots"]
 
 # 系统剪贴板(复制粘贴)。桌面用 arboard。
 [target.'cfg(not(any(target_os = "ios", target_os = "android")))'.dependencies]
