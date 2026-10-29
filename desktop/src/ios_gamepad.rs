@@ -2,7 +2,7 @@
 //!
 //! 摩尔庄园靠方向键走路、空格交互。iOS 真机无实体键盘,故叠一层原生 UILabel 按钮。
 //! 复用 `ios_textbar` 同法:**非交互**叠层(userInteractionEnabled=false,触摸穿透回 winit),
-//! 由 main.rs 的 Touch 处理按坐标命中 → 按下发 KeyDown、抬起发 KeyUp(支持按住持续走 + 多指)。
+//! 由 lib.rs 的 Touch 处理按坐标命中 → 按下发 KeyDown、抬起发 KeyUp(支持按住持续走 + 多指)。
 //! 切换钮常驻;方向键/空格面板默认隐藏,点切换钮显示/隐藏。
 
 use objc2::rc::Retained;
@@ -25,6 +25,8 @@ fn to_cg(r: pad_layout::Rect) -> CGRect {
 #[derive(Clone, Copy, PartialEq)]
 pub enum GamepadHit {
     Key(GamepadKey),
+    /// 十字区(四个箭头的外接矩形,含斜角):方向由 `pad_layout::dpad_dirs` 按触点位置算。
+    DPad,
     Toggle,
 }
 
@@ -45,6 +47,8 @@ pub struct GamePad {
     toggle_rect: (f64, f64, f64, f64),
     /// 面板内按钮命中矩形(物理像素):(hit, x0, y0, x1, y1)。
     pad_rects: Vec<(GamepadHit, f64, f64, f64, f64)>,
+    /// 十字区(四个箭头的外接矩形,物理像素)。
+    dpad_area: pad_layout::Rect,
     /// 面板是否可见。
     visible: bool,
 }
@@ -106,6 +110,7 @@ impl GamePad {
             pad_btns,
             toggle_rect: (0.0, 0.0, 0.0, 0.0),
             pad_rects: Vec::new(),
+            dpad_area: pad_layout::Rect::default(),
             visible: false,
         })
     }
@@ -135,6 +140,10 @@ impl GamePad {
             btn.label.setFrame(to_cg(r));
             self.pad_rects.push((btn.hit, r.x * scale, r.y * scale, r.right() * scale, r.bottom() * scale));
         }
+        let (x0, y0) = (l.left.x.min(l.up.x), l.up.y.min(l.left.y));
+        let (x1, y1) = (l.right.right().max(l.up.right()), l.down.bottom().max(l.left.bottom()));
+        self.dpad_area =
+            pad_layout::Rect::new(x0 * scale, y0 * scale, (x1 - x0) * scale, (y1 - y0) * scale);
         self._toggle.setFrame(to_cg(l.toggle));
         self.toggle_rect = (
             l.toggle.x * scale,
@@ -143,6 +152,11 @@ impl GamePad {
             l.toggle.bottom() * scale,
         );
         l.mode
+    }
+
+    /// 十字区(物理像素)。
+    pub fn dpad_area(&self) -> pad_layout::Rect {
+        self.dpad_area
     }
 
     pub fn toggle(&mut self) {
@@ -158,6 +172,10 @@ impl GamePad {
         }
         if !self.visible {
             return None;
+        }
+        let d = self.dpad_area;
+        if x >= d.x && x <= d.right() && y >= d.y && y <= d.bottom() {
+            return Some(GamepadHit::DPad);
         }
         self.pad_rects
             .iter()

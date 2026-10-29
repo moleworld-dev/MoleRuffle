@@ -170,7 +170,7 @@ struct App {
     gamepad: Option<ios_gamepad::GamePad>,
     /// 正在按住虚拟手柄键的触摸:touch id → 键(支持按住持续走 + 多指同时按方向+空格)。
     #[cfg(target_os = "ios")]
-    gamepad_touches: std::collections::HashMap<u64, keymap::GamepadKey>,
+    gamepad_touches: std::collections::HashMap<u64, GamepadTouch>,
 }
 
 /// 进入 tokio 运行时上下文(reqwest / socket 异步依赖它)。
@@ -183,6 +183,34 @@ macro_rules! enter_runtime {
 /// 渲染表面 / 视口尺寸(物理像素)。
 ///
 /// iOS 用 `outer_size`(整个全屏 view),**不要**用 `inner_size`(安全区,内缩且偏小):
+/// 一根正在按虚拟手柄的手指。
+#[derive(Clone, Copy)]
+#[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+enum GamepadTouch {
+    /// 按着空格等单键。
+    Key(keymap::GamepadKey),
+    /// 按在十字区:当前方向(随滑动更新,可斜走)。
+    DPad(pad_layout::Dirs),
+    /// 点切换钮的那次触摸:后续移动/抬起一并吞掉,不漏给游戏。
+    Swallow,
+}
+
+impl GamepadTouch {
+    #[cfg_attr(not(target_os = "ios"), allow(dead_code))]
+    fn keys(self) -> Vec<keymap::GamepadKey> {
+        use keymap::GamepadKey::*;
+        match self {
+            Self::Key(k) => vec![k],
+            Self::DPad(d) => [Up, Down, Left, Right]
+                .into_iter()
+                .zip(d)
+                .filter_map(|(k, on)| on.then_some(k))
+                .collect(),
+            Self::Swallow => Vec::new(),
+        }
+    }
+}
+
 /// winit iOS 的 `Touch.location` 是相对全屏 window 的坐标、CAMetalLayer 也是全屏;
 /// 若拿安全区尺寸当 viewport,渲染会被拉伸,且触摸坐标空间(全屏)≠ viewport(安全区)
 /// → 触摸偏移(越靠边偏越多)。桌面用 `inner_size`(客户区,排除标题栏)。
@@ -919,11 +947,14 @@ impl App {
         #[cfg_attr(not(target_os = "ios"), allow(unused_mut))]
         let mut keys: Vec<_> = self.keys_held.drain().collect();
         #[cfg(target_os = "ios")]
-        keys.extend(
-            self.gamepad_touches
-                .drain()
-                .map(|(_, k)| keymap::gamepad_key_descriptor(k)),
-        );
+        {
+            keys.extend(
+                self.held_gamepad_keys()
+                    .into_iter()
+                    .map(keymap::gamepad_key_descriptor),
+            );
+            self.gamepad_touches.clear();
+        }
         if keys.is_empty() {
             return;
         }
@@ -934,6 +965,40 @@ impl App {
             }
         });
         tracing::info!("{reason}:补发 {n} 个按键抬起(防卡键)");
+    }
+
+    /// 所有手指当前按住的虚拟手柄键(去重:两根手指按同一个键只算一个)。
+    #[cfg(target_os = "ios")]
+    fn held_gamepad_keys(&self) -> Vec<keymap::GamepadKey> {
+        let mut keys: Vec<keymap::GamepadKey> = Vec::new();
+        for t in self.gamepad_touches.values() {
+            for k in t.keys() {
+                if !keys.contains(&k) {
+                    keys.push(k);
+                }
+            }
+        }
+        keys
+    }
+
+    /// 对比变化前后按住的键,只给新按下的发 KeyDown、松开的发 KeyUp
+    /// (另一根手指还按着同一个键时不发抬起,角色不会中途停下)。
+    #[cfg(target_os = "ios")]
+    fn emit_gamepad_changes(&mut self, before: &[keymap::GamepadKey]) {
+        let after = self.held_gamepad_keys();
+        let ups: Vec<_> = before.iter().filter(|k| !after.contains(k)).copied().collect();
+        let downs: Vec<_> = after.iter().filter(|k| !before.contains(k)).copied().collect();
+        if ups.is_empty() && downs.is_empty() {
+            return;
+        }
+        self.with_player(|p| {
+            for k in ups {
+                p.handle_event(PlayerEvent::KeyUp { key: keymap::gamepad_key_descriptor(k) });
+            }
+            for k in downs {
+                p.handle_event(PlayerEvent::KeyDown { key: keymap::gamepad_key_descriptor(k) });
+            }
+        });
     }
 
     fn reclaim_memory(&mut self, reason: &str) {
@@ -1306,32 +1371,40 @@ impl ApplicationHandler<UserEvent> for App {
                         None
                     };
                     if held.is_some() || hit.is_some() {
+                        let before = self.held_gamepad_keys();
                         match phase {
                             TouchPhase::Started => match hit {
                                 Some(ios_gamepad::GamepadHit::Toggle) => {
                                     if let Some(gp) = self.gamepad.as_mut() {
                                         gp.toggle();
                                     }
+                                    self.gamepad_touches.insert(id, GamepadTouch::Swallow);
                                 }
                                 Some(ios_gamepad::GamepadHit::Key(k)) => {
-                                    self.gamepad_touches.insert(id, k);
-                                    let key = keymap::gamepad_key_descriptor(k);
-                                    self.with_player(|p| {
-                                        p.handle_event(PlayerEvent::KeyDown { key })
-                                    });
+                                    self.gamepad_touches.insert(id, GamepadTouch::Key(k));
+                                }
+                                Some(ios_gamepad::GamepadHit::DPad) => {
+                                    if let Some(area) = self.gamepad.as_ref().map(|g| g.dpad_area()) {
+                                        let dirs = pad_layout::dpad_dirs(x, y, area, [false; 4]);
+                                        self.gamepad_touches.insert(id, GamepadTouch::DPad(dirs));
+                                    }
                                 }
                                 None => {}
                             },
-                            TouchPhase::Ended | TouchPhase::Cancelled => {
-                                if let Some(k) = self.gamepad_touches.remove(&id) {
-                                    let key = keymap::gamepad_key_descriptor(k);
-                                    self.with_player(|p| {
-                                        p.handle_event(PlayerEvent::KeyUp { key })
-                                    });
+                            TouchPhase::Moved => {
+                                // 十字区:按住滑动即换向 / 斜走;其余按住的键保持不变。
+                                if let (Some(GamepadTouch::DPad(prev)), Some(area)) =
+                                    (held, self.gamepad.as_ref().map(|g| g.dpad_area()))
+                                {
+                                    let dirs = pad_layout::dpad_dirs(x, y, area, prev);
+                                    self.gamepad_touches.insert(id, GamepadTouch::DPad(dirs));
                                 }
                             }
-                            TouchPhase::Moved => { /* 按住中,吞掉,保持 KeyDown */ }
+                            TouchPhase::Ended | TouchPhase::Cancelled => {
+                                self.gamepad_touches.remove(&id);
+                            }
                         }
+                        self.emit_gamepad_changes(&before);
                         return;
                     }
                 }

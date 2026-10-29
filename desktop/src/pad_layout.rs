@@ -229,8 +229,55 @@ fn bottom_bar(
     PadLayout { mode, game, up, down, left, right, space, toggle }
 }
 
+/// 十字键四个方向:`[上, 下, 左, 右]`。
+pub type Dirs = [bool; 4];
+
+/// 按下阈值与松开阈值(相对十字区半宽/半高的比例)。两者之间是滞回带,防止手指停在
+/// 边界附近时方向来回跳。思路参考 OmniPad 的 DPadCore(MIT,按轴独立判定),阈值另加了滞回。
+const DPAD_PRESS: f64 = 0.3;
+const DPAD_RELEASE: f64 = 0.2;
+
+/// 十字键:手指位置 → 按住的方向。整个十字区(四个箭头的外接矩形 `area`)当成一个控件,
+/// 按手指相对中心的位置横竖两轴分别判断,两轴都过阈值即斜走;手指滑出十字区也照常判断
+/// (坐标夹到 ±1),直到抬起。`prev` 是这根手指上一次的结果(滞回用)。
+pub fn dpad_dirs(x: f64, y: f64, area: Rect, prev: Dirs) -> Dirs {
+    let half_w = (area.w / 2.0).max(1.0);
+    let half_h = (area.h / 2.0).max(1.0);
+    let nx = ((x - (area.x + half_w)) / half_w).clamp(-1.0, 1.0);
+    let ny = ((y - (area.y + half_h)) / half_h).clamp(-1.0, 1.0);
+    let axis = |v: f64, neg_was: bool, pos_was: bool| -> (bool, bool) {
+        let neg = if neg_was { v < -DPAD_RELEASE } else { v < -DPAD_PRESS };
+        let pos = if pos_was { v > DPAD_RELEASE } else { v > DPAD_PRESS };
+        (neg, pos)
+    };
+    let (up, down) = axis(ny, prev[0], prev[1]);
+    let (left, right) = axis(nx, prev[2], prev[3]);
+    [up, down, left, right]
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn dpad_axis_split_diagonal_and_hysteresis() {
+        let area = Rect::new(0.0, 0.0, 200.0, 200.0);
+        let none = [false; 4];
+        // 中心附近:不按任何方向
+        assert_eq!(dpad_dirs(100.0, 100.0, area, none), none);
+        // 正上方
+        assert_eq!(dpad_dirs(100.0, 20.0, area, none), [true, false, false, false]);
+        // 右下斜角
+        assert_eq!(dpad_dirs(190.0, 190.0, area, none), [false, true, false, true]);
+        // 滑到左边:上松开、左按下(单指换向)
+        let up = [true, false, false, false];
+        assert_eq!(dpad_dirs(10.0, 100.0, area, up), [false, false, true, false]);
+        // 滞回:比例 0.25(介于 0.2 与 0.3)时保持原状态
+        let y = 100.0 - 0.25 * 100.0;
+        assert_eq!(dpad_dirs(100.0, y, area, none), none);
+        assert_eq!(dpad_dirs(100.0, y, area, up), up);
+        // 滑出十字区仍按方向判断
+        assert_eq!(dpad_dirs(-500.0, 100.0, area, none), [false, false, true, false]);
+    }
     use super::*;
 
     /// 各机型横屏逻辑尺寸 + 大致安全区。
