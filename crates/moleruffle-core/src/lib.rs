@@ -63,15 +63,34 @@ pub fn game_base_url() -> Url {
 /// 这是五端共享的关键装配:平台壳层先 `with_renderer/with_audio/with_navigator`,
 /// 再调本函数补齐摩尔庄园需要的设置(尤其是 spoof,缺了它进不去游戏)。
 pub fn apply_mole_settings(builder: PlayerBuilder) -> PlayerBuilder {
+    // ★家园/场景灰屏根治(#1010 族,ABC-A1):被加载 SWF(如家园默认背景 160030.swf)主时间轴
+    // 第1帧的嵌套多帧 MovieClip(mc2/door_mc)与命名按钮 btn,在 Ruffle 单趟 construct_frame 里
+    // 不被构造 → 游戏加载回调访问 goodsMC.mc2.getChildAt(0) / owner.parent["btn"] 拿到 undefined
+    // → #1010/#1009 → 家园背景初始化夭折灰屏。启用 fork 里已实现的 eager-construct 递归补齐
+    // (loader.rs:2112 门控 + :2421 递归):只【补上】Flash 派发 complete 前本就会做的构造,从不
+    // 删改重排(loader.rs:2101-2104),且只对调用本函数的摩尔庄园路径生效(摩尔勇士 hero.61.com
+    // 不调此函数,拿逐字节上游行为,隔离成立)。live 读 env,启动期 set_var 立即生效。
+    // SAFETY: 本函数在客户端启动期(SWF 加载前)单线程调用一次,无并发 env 读写竞争。
+    unsafe { std::env::set_var("MOLE_LOADER_EAGER_CONSTRUCT", "1"); }
+
     // 画质/MSAA:iOS 真机关 MSAA(Low=1x)。Apple GPU 最大 4x MSAA,High8x8 在真机被钳到 4x、
     // 仍要按全屏物理像素(~2868×1320)分配 ~90MB+ MSAA framebuffer,且乘进每个滤镜/cacheAsBitmap
     // 离屏目标 → 进游戏世界叠纹理超 iOS jetsam 内存上限被 SIGKILL(实测真机闪退)。关 MSAA + 壳层
     // render_scale 降采样后显存大降。摩尔庄园源美术仅 960×560,关 MSAA 视觉几乎无感。桌面窗口小,
     // 保留 High8x8 高画质。
     #[cfg(target_os = "ios")]
-    let quality = StageQuality::Low;
+    let default_quality = StageQuality::Low;
     #[cfg(not(target_os = "ios"))]
-    let quality = StageQuality::High8x8;
+    let default_quality = StageQuality::High8x8;
+    // 实验开关:MOLE_QUALITY=low|medium|high|high8x8 运行时选画质/MSAA(测 MSAA 对高帧率 GPU 成本)。
+    // 未设=各端默认。采样数:low=1x medium=2x high=4x high8x8=8x(Metal 钳 4x)。
+    let quality = match std::env::var("MOLE_QUALITY").as_deref() {
+        Ok("low") => StageQuality::Low,
+        Ok("medium") => StageQuality::Medium,
+        Ok("high") => StageQuality::High,
+        Ok("high8x8") => StageQuality::High8x8,
+        _ => default_quality,
+    };
     builder
         .with_autoplay(true)
         .with_letterbox(Letterbox::On)
@@ -87,6 +106,10 @@ pub fn apply_mole_settings(builder: PlayerBuilder) -> PlayerBuilder {
         .with_page_url(Some(SPOOF_URL.to_string()))
         // 伪装成较新的 Flash Player 版本(摩尔庄园按 plugin 版本判断兼容)
         .with_player_version(Some(32))
+        // 实验开关:MOLE_FPS=60 强制覆盖 SWF 的 24fps(用来测摩尔庄园是"帧基"还是"时间基")。
+        // 默认(未设/解析失败)= None → 用 SWF 自带 24fps,零影响。帧基游戏提帧率会整体加速,
+        // 时间基则只变顺不变快。forced_frame_rate 由 with_frame_rate(Some) 自动置真、覆盖 SWF 头。
+        .with_frame_rate(std::env::var("MOLE_FPS").ok().and_then(|s| s.parse::<f64>().ok()))
 }
 
 /// 摩尔庄园本地存储(Flash `SharedObject` / `.sol`)的磁盘根目录。
@@ -202,6 +225,36 @@ impl NavigatorInterface for MoleNavigatorInterface {
     }
 }
 
+/// 已知**只含拉丁字形、无中文**的系统字体名。摩尔庄园里由 `new TextField()` +
+/// `new TextFormat()`(未设 `.font`)动态创建的文本(如世界地图弹窗里各地图的
+/// 任务/游戏/购物提示行、"任务"/"游戏"等分区标题)会用 Flash 默认字体名
+/// **"Times New Roman"**;引擎把它当 `_serif` 设备字体解析,`load_device_font`
+/// 第 1 步在 macOS/Windows 上会精确命中系统里**真正的** Times New Roman(纯拉丁),
+/// 于是中文字形缺失、只剩 ASCII 的 `"* "` 和分隔号 `"--"` 被渲染 → 用户看到 "* --"。
+/// 对这些名字跳过第 1 步精确匹配,直接落到下面的中文回退链 / 打包字体,即可补上中文。
+const LATIN_ONLY_DEVICE_FONTS: &[&str] = &[
+    "Times New Roman",
+    "Times",
+    "Arial",
+    "Helvetica",
+    "Tahoma",
+    "Verdana",
+    "Georgia",
+    "Courier New",
+    "Courier",
+    "Consolas",
+];
+
+/// MoleRuffle opt-in:`MOLE_CJK_DEVICE_FONTS=1` 时,对 `LATIN_ONLY_DEVICE_FONTS`
+/// 里的纯拉丁字体名跳过系统精确匹配,改用带中文的回退字体解析,修复世界地图弹窗
+/// 提示行等动态文本 "* --"(中文缺字)问题。默认关闭 = 保持上游/现状行为
+/// (与共用此 fork 的“摩尔勇士”同事一致,不影响他们)。
+fn mole_cjk_device_fonts() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("MOLE_CJK_DEVICE_FONTS").as_deref() == Ok("1"))
+}
+
 /// 设备字体回退顺序:任何字体名都先试精确匹配,失败再依次退到这些
 /// “一定带中文”的字体,保证摩尔庄园的动态文本(玩家名/聊天/系统提示)能显示中文。
 const FONT_FALLBACKS: &[&str] = &[
@@ -310,8 +363,17 @@ impl MoleUiBackend {
 
 impl UiBackend for MoleUiBackend {
     fn load_device_font(&self, query: &FontQuery, register: &mut dyn FnMut(FontDefinition)) {
+        // 0) opt-in(MOLE_CJK_DEVICE_FONTS=1):游戏请求的是已知纯拉丁字体名
+        //    (Times New Roman / Arial / Tahoma …)时,跳过第 1 步的系统精确匹配
+        //    ——否则 macOS/Windows 会命中真正的纯拉丁字体,导致中文缺字(世界地图
+        //    提示行显示 "* --")。直接落到下面的中文回退链 / 打包字体来补中文。
+        let skip_exact = mole_cjk_device_fonts()
+            && LATIN_ONLY_DEVICE_FONTS
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(query.name.trim()));
+
         // 1) 先按游戏请求的确切字体名找
-        if self.try_register(&query.name, query, register) {
+        if !skip_exact && self.try_register(&query.name, query, register) {
             return;
         }
         // 2) 退到系统里带中文的字体(macOS/Windows 通常命中)
